@@ -23,6 +23,7 @@ API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "127.0.0.1")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "health_history.jsonl")
 USE_AI_FALL_MODEL = os.getenv("USE_AI_FALL_MODEL", "true").lower() == "true"
+API_VERBOSE_OUTPUT = os.getenv("API_VERBOSE_OUTPUT", "false").lower() == "true"
 
 
 def _resolve_api_port() -> int:
@@ -91,8 +92,90 @@ def _read_history(limit=50):
     return records[-limit:][::-1]
 
 
+def _to_number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_non_negative_number(value):
+    numeric = _to_number(value)
+    if numeric is None or numeric < 0.0:
+        return None
+    return numeric
+
+
+def _normalize_health_data_for_frontend(raw_data):
+    bpm = _to_non_negative_number(raw_data.get("bpm"))
+    spo2 = _to_non_negative_number(raw_data.get("spo2"))
+    temp = _to_non_negative_number(raw_data.get("temp"))
+    ts = raw_data.get("ts", raw_data.get("timestamp"))
+
+    return {
+        "ts": int(ts) if ts is not None else None,
+        "bpm": int(round(bpm)) if bpm is not None else None,
+        "spo2": round(spo2, 1) if spo2 is not None else None,
+        "temp": round(temp, 2) if temp is not None else None,
+        "status": raw_data.get("status", "NORMAL"),
+    }
+
+
+def _format_fall_for_frontend(fall_prediction):
+    fall = dict(fall_prediction)
+    confidence = _to_number(fall.get("confidence"))
+    confidence = 0.0 if confidence is None else max(0.0, min(1.0, confidence))
+    fall_detected = bool(fall.get("fall_detected", False))
+    label = str(fall.get("label", "UNKNOWN"))
+
+    if label == "WARMUP":
+        state = "warming_up"
+    elif fall_detected:
+        state = "alert"
+    else:
+        state = "normal"
+
+    fall["confidence"] = round(confidence, 3)
+    fall["confidence_percent"] = round(confidence * 100.0, 1)
+    fall["state"] = state
+    return fall
+
+
+def _build_display_payload(normalized_data, fall_prediction):
+    accel_x = _to_number(normalized_data.get("ax")) or 0.0
+    accel_y = _to_number(normalized_data.get("ay")) or 0.0
+    accel_z = _to_number(normalized_data.get("az")) or 0.0
+    gyro_x = _to_number(normalized_data.get("gx")) or 0.0
+    gyro_y = _to_number(normalized_data.get("gy")) or 0.0
+    gyro_z = _to_number(normalized_data.get("gz")) or 0.0
+
+    accel_mag = (accel_x ** 2 + accel_y ** 2 + accel_z ** 2) ** 0.5
+    gyro_mag = (gyro_x ** 2 + gyro_y ** 2 + gyro_z ** 2) ** 0.5
+
+    return {
+        "timestamp": normalized_data.get("ts", normalized_data.get("timestamp")),
+        "status": normalized_data.get("status"),
+        "vitals": {
+            "bpm": normalized_data.get("bpm"),
+            "spo2": normalized_data.get("spo2"),
+            "temp": normalized_data.get("temp"),
+        },
+        "motion": {
+            "accel_magnitude": round(accel_mag, 4),
+            "gyro_magnitude": round(gyro_mag, 4),
+        },
+        "fall": {
+            "detected": fall_prediction.get("fall_detected", False),
+            "label": fall_prediction.get("label"),
+            "state": fall_prediction.get("state"),
+            "confidence_percent": fall_prediction.get("confidence_percent"),
+        },
+    }
+
+
 def _to_flutter_packet(health_data, source_topic):
-    data = health_data.to_dict()
+    raw_data = health_data.to_dict()
+    data = _normalize_health_data_for_frontend(raw_data)
     model = _get_fall_model()
     fall_input = FallInput(
         ax=health_data.ax,
@@ -106,15 +189,20 @@ def _to_flutter_packet(health_data, source_topic):
         temp=health_data.temp,
         timestamp=health_data.timestamp,
     )
-    fall_prediction = model.predict(fall_input).to_dict()
-
-    return {
+    fall_prediction = _format_fall_for_frontend(model.predict(fall_input).to_dict())
+    packet = {
         "type": "health_update",
         "source_topic": source_topic,
         "server_timestamp": int(time.time()),
         "data": data,
         "fall": fall_prediction,
     }
+
+    if API_VERBOSE_OUTPUT:
+        packet["data_raw"] = raw_data
+        packet["display"] = _build_display_payload(raw_data, fall_prediction)
+
+    return packet
 
 # ====== CALLBACK ======
 def on_connect(client, userdata, flags, reason_code, properties=None):
@@ -232,23 +320,19 @@ def get_health_schema():
                 "bpm": 78,
                 "spo2": 97,
                 "temp": 36.5,
-                "ax": 0.12,
-                "ay": -0.98,
-                "az": 9.81,
-                "gx": 0.01,
-                "gy": 0.02,
-                "gz": 0.0,
-                "ir": 523456,
-                "red": 498123,
-                "heart_rate": 78,
-                "timestamp": 1710000000,
                 "status": "NORMAL",
             },
             "fall": {
                 "fall_detected": False,
                 "confidence": 0.423,
+                "confidence_percent": 42.3,
                 "label": "NO_FALL",
+                "state": "normal",
             },
+        },
+        "optional_verbose_fields": {
+            "enable_env": "API_VERBOSE_OUTPUT=true",
+            "extra_keys": ["data_raw", "display"],
         },
     }
     return jsonify(example)
