@@ -4,6 +4,7 @@ import certifi
 import time
 import os
 import json
+import traceback
 from threading import Lock
 
 from flask import Flask, jsonify, request
@@ -19,8 +20,18 @@ CLIENT_ID = "python_backend"
 MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "127.0.0.1")
-API_PORT = int(os.getenv("API_PORT", "5050"))
 HISTORY_FILE = os.getenv("HISTORY_FILE", "health_history.jsonl")
+
+
+def _resolve_api_port() -> int:
+    raw_port = os.getenv("API_PORT") or os.getenv("PORT") or "5050"
+    try:
+        return int(raw_port)
+    except ValueError:
+        return 5050
+
+
+API_PORT = _resolve_api_port()
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -204,7 +215,17 @@ def main():
         print(f"🚀 API da khoi dong (bind): http://{API_BIND_HOST}:{API_PORT}")
         print(f"🌐 Truy cap tren may nay: http://{API_ACCESS_HOST}:{API_PORT}")
         print("🔌 Su kien WebSocket: health_update")
-        socketio.run(app, host=API_BIND_HOST, port=API_PORT)
+        # Render temp deploy: allow Werkzeug server to run in non-debug env.
+        socketio.run(
+            app,
+            host=API_BIND_HOST,
+            port=API_PORT,
+            allow_unsafe_werkzeug=True,
+        )
+    except Exception:
+        print("❌ Loi khoi dong backend:")
+        traceback.print_exc()
+        raise
     finally:
         if mqtt_started:
             client.loop_stop()
