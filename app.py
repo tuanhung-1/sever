@@ -89,6 +89,9 @@ def _to_flutter_packet(health_data, source_topic):
         gx=health_data.gx,
         gy=health_data.gy,
         gz=health_data.gz,
+        heart_rate=health_data.heart_rate,
+        spo2=health_data.spo2 or 0.0,
+        temp=health_data.temp,
         timestamp=health_data.timestamp,
     )
     fall_prediction = fall_model.predict(fall_input).to_dict()
