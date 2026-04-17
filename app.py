@@ -37,11 +37,22 @@ API_PORT = _resolve_api_port()
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
-fall_model = create_fall_model(use_ai=USE_AI_FALL_MODEL)
 
 _latest_packet = None
 _packet_lock = Lock()
 _history_lock = Lock()
+_fall_model_lock = Lock()
+_fall_model = None
+
+
+def _get_fall_model():
+    global _fall_model
+    if _fall_model is None:
+        with _fall_model_lock:
+            if _fall_model is None:
+                _fall_model = create_fall_model(use_ai=USE_AI_FALL_MODEL)
+                print(f"🤖 Fall model da nap: {'AI(model.h5)' if USE_AI_FALL_MODEL else 'RuleBased'}")
+    return _fall_model
 
 
 def _append_history(packet):
@@ -82,6 +93,7 @@ def _read_history(limit=50):
 
 def _to_flutter_packet(health_data, source_topic):
     data = health_data.to_dict()
+    model = _get_fall_model()
     fall_input = FallInput(
         ax=health_data.ax,
         ay=health_data.ay,
@@ -94,7 +106,7 @@ def _to_flutter_packet(health_data, source_topic):
         temp=health_data.temp,
         timestamp=health_data.timestamp,
     )
-    fall_prediction = fall_model.predict(fall_input).to_dict()
+    fall_prediction = model.predict(fall_input).to_dict()
 
     return {
         "type": "health_update",
@@ -225,10 +237,11 @@ def main():
 
     try:
         try:
-            client.connect(BROKER, MQTT_PORT)
+            # Connect asynchronously so API can bind port immediately on cloud deploy.
+            client.connect_async(BROKER, MQTT_PORT)
             client.loop_start()
             mqtt_started = True
-            print("✅ MQTT loop da khoi dong")
+            print("✅ MQTT loop da khoi dong (async)")
         except Exception as exc:
             print("⚠️ Khong the ket noi MQTT luc khoi dong:", exc)
             if MQTT_REQUIRED:
