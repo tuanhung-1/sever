@@ -10,6 +10,7 @@ from threading import Lock
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
 
+from fall_model import FallInput, create_fall_model
 from model import from_json
 
 BROKER = "dfee921e5f16440e8f3892ed3564c06d.s1.eu.hivemq.cloud"
@@ -21,6 +22,7 @@ MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "127.0.0.1")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "health_history.jsonl")
+USE_AI_FALL_MODEL = os.getenv("USE_AI_FALL_MODEL", "false").lower() == "true"
 
 
 def _resolve_api_port() -> int:
@@ -35,6 +37,7 @@ API_PORT = _resolve_api_port()
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+fall_model = create_fall_model(use_ai=USE_AI_FALL_MODEL)
 
 _latest_packet = None
 _packet_lock = Lock()
@@ -79,12 +82,23 @@ def _read_history(limit=50):
 
 def _to_flutter_packet(health_data, source_topic):
     data = health_data.to_dict()
+    fall_input = FallInput(
+        ax=health_data.ax,
+        ay=health_data.ay,
+        az=health_data.az,
+        gx=health_data.gx,
+        gy=health_data.gy,
+        gz=health_data.gz,
+        timestamp=health_data.timestamp,
+    )
+    fall_prediction = fall_model.predict(fall_input).to_dict()
 
     return {
         "type": "health_update",
         "source_topic": source_topic,
         "server_timestamp": int(time.time()),
         "data": data,
+        "fall": fall_prediction,
     }
 
 # ====== CALLBACK ======
@@ -176,6 +190,11 @@ def get_health_schema():
             "heart_rate": 78,
             "timestamp": 1710000000,
             "status": "NORMAL",
+        },
+        "fall": {
+            "fall_detected": False,
+            "confidence": 0.423,
+            "label": "NO_FALL",
         },
     }
     return jsonify(example)

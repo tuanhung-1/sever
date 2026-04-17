@@ -8,11 +8,12 @@ model later without changing the rest of the backend flow.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict
 
 
-AI_MODEL_NAME = "your_model_name"
-AI_MODEL_PATH = f"models/{AI_MODEL_NAME}"
+AI_MODEL_NAME = "model.h5"
+AI_MODEL_PATH = str(Path(__file__).resolve().parent / AI_MODEL_NAME)
 
 
 @dataclass(frozen=True)
