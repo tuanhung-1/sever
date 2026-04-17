@@ -16,6 +16,7 @@ MQTT_PORT = 8883
 USERNAME = "hungdaica123"
 PASSWORD = "Hungpro123"
 CLIENT_ID = "python_backend"
+MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "5050"))
@@ -187,17 +188,27 @@ def get_health_history():
     })
 def main():
     client = build_mqtt_client()
+    mqtt_started = False
 
     try:
-        client.connect(BROKER, MQTT_PORT)
-        client.loop_start()
+        try:
+            client.connect(BROKER, MQTT_PORT)
+            client.loop_start()
+            mqtt_started = True
+            print("✅ MQTT loop da khoi dong")
+        except Exception as exc:
+            print("⚠️ Khong the ket noi MQTT luc khoi dong:", exc)
+            if MQTT_REQUIRED:
+                raise
+
         print(f"🚀 API da khoi dong (bind): http://{API_BIND_HOST}:{API_PORT}")
         print(f"🌐 Truy cap tren may nay: http://{API_ACCESS_HOST}:{API_PORT}")
         print("🔌 Su kien WebSocket: health_update")
         socketio.run(app, host=API_BIND_HOST, port=API_PORT)
     finally:
-        client.loop_stop()
-        client.disconnect()
+        if mqtt_started:
+            client.loop_stop()
+            client.disconnect()
 
 
 if __name__ == "__main__":
