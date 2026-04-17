@@ -22,7 +22,7 @@ MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "127.0.0.1")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "health_history.jsonl")
-USE_AI_FALL_MODEL = os.getenv("USE_AI_FALL_MODEL", "false").lower() == "true"
+USE_AI_FALL_MODEL = os.getenv("USE_AI_FALL_MODEL", "true").lower() == "true"
 
 
 def _resolve_api_port() -> int:
