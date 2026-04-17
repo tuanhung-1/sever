@@ -52,10 +52,10 @@ class FallInput:
     gx: float
     gy: float
     gz: float
+    timestamp: int
     heart_rate: float = 0.0
     spo2: float = 0.0
     temp: float = 0.0
-    timestamp: int
 
 
 @dataclass(frozen=True)
