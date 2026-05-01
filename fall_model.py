@@ -46,13 +46,11 @@ class FallPrediction:
 
     fall_detected: bool
     confidence: float
-    label: str
 
-    def to_dict(self) -> Dict[str, float | bool | str]:
+    def to_dict(self) -> Dict[str, float | bool]:
         return {
-            "fall_detected": self.fall_detected,
-            "confidence": self.confidence,
-            "label": self.label,
+            "detected": self.fall_detected,
+            "confidence": round(self.confidence, 3),
         }
 
 
@@ -86,8 +84,7 @@ class RuleBasedFallModel(BaseFallModel):
 
         return FallPrediction(
             fall_detected=is_fall,
-            confidence=round(confidence, 3),
-            label="FALL" if is_fall else "NO_FALL",
+            confidence=confidence,
         )
 
 
@@ -169,7 +166,6 @@ class PlaceholderAIFallModel(BaseFallModel):
             return FallPrediction(
                 fall_detected=False,
                 confidence=0.0,
-                label="WARMUP",
             )
 
         window = self._build_window_for_inference()
@@ -178,8 +174,7 @@ class PlaceholderAIFallModel(BaseFallModel):
 
         return FallPrediction(
             fall_detected=is_fall,
-            confidence=round(prob, 3),
-            label="FALL" if is_fall else "NO_FALL",
+            confidence=prob,
         )
 
 

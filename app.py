@@ -189,23 +189,14 @@ def _normalize_health_data_for_frontend(raw_data):
 
 
 def _format_fall_for_frontend(fall_prediction):
-    fall = dict(fall_prediction)
-    confidence = _to_number(fall.get("confidence"))
+    detected = bool(fall_prediction.get("detected", False))
+    confidence = _to_number(fall_prediction.get("confidence"))
     confidence = 0.0 if confidence is None else max(0.0, min(1.0, confidence))
-    fall_detected = bool(fall.get("fall_detected", False))
-    label = str(fall.get("label", "UNKNOWN"))
-
-    if label == "WARMUP":
-        state = "warming_up"
-    elif fall_detected:
-        state = "alert"
-    else:
-        state = "normal"
-
-    fall["confidence"] = round(confidence, 3)
-    fall["confidence_percent"] = round(confidence * 100.0, 1)
-    fall["state"] = state
-    return fall
+    
+    return {
+        "detected": detected,
+        "confidence": round(confidence, 3),
+    }
 
 
 def _build_display_payload(normalized_data, fall_prediction):
@@ -325,19 +316,17 @@ def on_message(client, userdata, msg):
 
             with _packet_lock:
                 global _latest_packet
+                global _latest_raw_payload
                 _latest_packet = packet
+                _latest_raw_payload = normalized_raw_payload
 
             _append_history(packet)
             socketio.emit("health_update", packet)
 
-        with _packet_lock:
-            global _latest_raw_payload
-            _latest_raw_payload = normalized_raw_payload
-
         if latest_packet is not None:
             print(
                 f"📊 Da xu ly {len(health_samples)} mau | "
-                f"fall={latest_packet['fall']['label']} conf={latest_packet['fall']['confidence']}"
+                f"fall={latest_packet['fall']['detected']} conf={latest_packet['fall']['confidence']}"
             )
     except ValueError as exc:
         print("❌ Payload khong hop le:", exc)
