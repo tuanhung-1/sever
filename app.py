@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
 
 from fall_model import FallInput, create_fall_model
-from model import from_json_samples
+from model import from_json_samples, classify
 
 BROKER = "dfee921e5f16440e8f3892ed3564c06d.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
@@ -40,6 +40,7 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 _latest_packet = None
+_latest_raw_payload = None
 _packet_lock = Lock()
 _history_lock = Lock()
 _fall_model_lock = Lock()
@@ -104,6 +105,72 @@ def _to_non_negative_number(value):
     if numeric is None or numeric < 0.0:
         return None
     return numeric
+
+
+def _normalize_series_field(value, field_name, as_int=False):
+    if isinstance(value, list):
+        source = value
+    elif value is None:
+        return []
+    else:
+        source = [value]
+
+    normalized = []
+    for item in source:
+        numeric = _to_number(item)
+        if numeric is None:
+            raise ValueError(f"Gia tri trong truong '{field_name}' khong hop le")
+        normalized.append(int(round(numeric)) if as_int else float(numeric))
+
+    return normalized
+
+
+def _normalize_raw_payload_for_api(raw_payload):
+    if not isinstance(raw_payload, dict):
+        raise ValueError("Payload khong hop le, can doi tuong JSON")
+
+    ts = raw_payload.get("ts", raw_payload.get("timestamp"))
+    ts_int = int(ts) if ts is not None else int(time.time() * 1000)
+
+    temp = _to_non_negative_number(raw_payload.get("temp"))
+    return {
+        "ts": ts_int,
+        "ts0": raw_payload.get("ts0"),
+        "temp": round(temp, 2) if temp is not None else None,
+        "sample_interval_ms": raw_payload.get("sample_interval_ms"),
+        "ir": _normalize_series_field(raw_payload.get("ir"), "ir", as_int=True),
+        "red": _normalize_series_field(raw_payload.get("red"), "red", as_int=True),
+        "ax": _normalize_series_field(raw_payload.get("ax"), "ax"),
+        "ay": _normalize_series_field(raw_payload.get("ay"), "ay"),
+        "az": _normalize_series_field(raw_payload.get("az"), "az"),
+        "gx": _normalize_series_field(raw_payload.get("gx"), "gx"),
+        "gy": _normalize_series_field(raw_payload.get("gy"), "gy"),
+        "gz": _normalize_series_field(raw_payload.get("gz"), "gz"),
+    }
+
+
+def _is_fall_alert_payload(raw_payload, topic):
+    if isinstance(topic, str) and topic.endswith("/alert"):
+        return True
+    if not isinstance(raw_payload, dict):
+        return False
+    return raw_payload.get("type") == "fall_alert" or raw_payload.get("event") == "fall_alert"
+
+
+def _build_fall_alert_packet(raw_payload, source_topic):
+    total_g = _to_number(raw_payload.get("total_g"))
+    ts = raw_payload.get("ts", raw_payload.get("timestamp"))
+
+    return {
+        "type": "fall_alert",
+        "source_topic": source_topic,
+        "server_timestamp": int(time.time()),
+        "data": {
+            "ts": int(ts) if ts is not None else None,
+            "total_g": round(total_g, 2) if total_g is not None else None,
+            "message": raw_payload.get("message", "fall_detected"),
+        },
+    }
 
 
 def _normalize_health_data_for_frontend(raw_data):
@@ -209,9 +276,10 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     if reason_code == 0:
         print("✅ Da ket noi HiveMQ Cloud")
 
+        client.subscribe("sensor/#")
         client.subscribe("health/#")
 
-        print("📡 Da dang ky topic: health/#")
+        print("📡 Da dang ky topic: sensor/#, health/#")
 
     else:
         print("❌ Ket noi that bai, ma loi:", reason_code)
@@ -223,11 +291,36 @@ def on_message(client, userdata, msg):
 
     try:
         raw = msg.payload.decode()
+        try:
+            raw_payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Payload JSON khong hop le") from exc
+
+        if _is_fall_alert_payload(raw_payload, msg.topic):
+            alert_packet = _build_fall_alert_packet(raw_payload, msg.topic)
+            with _packet_lock:
+                global _latest_raw_payload
+                _latest_raw_payload = raw_payload
+
+            _append_history(alert_packet)
+            socketio.emit("sensor_alert", alert_packet)
+            print(
+                f"🚨 Da nhan alert te nga tu {msg.topic} | total_g={alert_packet['data']['total_g']}"
+            )
+            return
+
+        normalized_raw_payload = _normalize_raw_payload_for_api(raw_payload)
         health_samples = from_json_samples(raw)
 
         latest_packet = None
         for health_data in health_samples:
+            # Classify health status based on vitals
+            status = classify(health_data.heart_rate, health_data.temp)
+            
             packet = _to_flutter_packet(health_data, msg.topic)
+            
+            # Update status in the packet
+            packet["data"]["status"] = status
             latest_packet = packet
 
             with _packet_lock:
@@ -236,6 +329,10 @@ def on_message(client, userdata, msg):
 
             _append_history(packet)
             socketio.emit("health_update", packet)
+
+        with _packet_lock:
+            global _latest_raw_payload
+            _latest_raw_payload = normalized_raw_payload
 
         if latest_packet is not None:
             print(
@@ -273,69 +370,20 @@ def build_mqtt_client():
 
 @app.get("/api/health/latest")
 def get_latest_health():
+    output_format = request.args.get("format", "packet").strip().lower()
+
+    if output_format not in ("packet", "raw"):
+        return jsonify({"message": "Tham so 'format' chi chap nhan: packet, raw"}), 400
+
     with _packet_lock:
+        if output_format == "raw":
+            if _latest_raw_payload is None:
+                return jsonify({"message": "Chua nhan duoc du lieu raw"}), 404
+            return jsonify(_latest_raw_payload)
+
         if _latest_packet is None:
             return jsonify({"message": "Chua nhan duoc du lieu suc khoe"}), 404
         return jsonify(_latest_packet)
-
-
-@app.get("/api/health/schema")
-def get_health_schema():
-    example = {
-        "accepted_input_formats": {
-            "single_sample": {
-                "ts": 1710000000,
-                "bpm": 78,
-                "spo2": 97,
-                "temp": 36.5,
-                "ax": 0.12,
-                "ay": -0.98,
-                "az": 9.81,
-                "gx": 0.01,
-                "gy": 0.02,
-                "gz": 0.0,
-                "ir": 523456,
-                "red": 498123,
-            },
-            "batch_samples": {
-                "ts": 1710000000,
-                "temp": 36.5,
-                "sample_interval_ms": 20,
-                "ir": [523456, 523501, 523520],
-                "red": [498123, 498166, 498201],
-                "ax": [0.12, 0.08, -0.21],
-                "ay": [-0.98, -1.03, -0.88],
-                "az": [9.81, 9.78, 9.74],
-                "gx": [0.01, 0.03, -0.02],
-                "gy": [0.02, 0.01, -0.01],
-                "gz": [0.0, -0.01, 0.02],
-            },
-        },
-        "output_item": {
-            "type": "health_update",
-            "source_topic": "health/data",
-            "server_timestamp": 1710000001,
-            "data": {
-                "ts": 1710000000,
-                "bpm": 78,
-                "spo2": 97,
-                "temp": 36.5,
-                "status": "NORMAL",
-            },
-            "fall": {
-                "fall_detected": False,
-                "confidence": 0.423,
-                "confidence_percent": 42.3,
-                "label": "NO_FALL",
-                "state": "normal",
-            },
-        },
-        "optional_verbose_fields": {
-            "enable_env": "API_VERBOSE_OUTPUT=true",
-            "extra_keys": ["data_raw", "display"],
-        },
-    }
-    return jsonify(example)
 
 
 @app.get("/api/health/history")

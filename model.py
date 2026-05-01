@@ -1,39 +1,4 @@
-"""
-model.py – Data model for incoming health telemetry payloads.
 
-Supported payload formats:
-
-1) Single-sample payload:
-{
-    "ts": 1710000000,
-    "bpm": 78,
-    "spo2": 97,
-    "temp": 36.5,
-  "ax": 0.12,
-  "ay": -0.98,
-  "az": 9.81,
-  "gx": 0.01,
-  "gy": 0.02,
-  "gz": 0.00,
-    "ir": 523456,
-    "red": 498123
-}
-
-2) Batch payload (from edge node):
-{
-    "ts": 1710000000,
-    "temp": 36.5,
-    "sample_interval_ms": 20,
-    "ir": [523456, 523500, ...],
-    "red": [498123, 498200, ...],
-    "ax": [0.12, 0.15, ...],
-    "ay": [-0.98, -1.02, ...],
-    "az": [9.81, 9.76, ...],
-    "gx": [0.01, 0.03, ...],
-    "gy": [0.02, 0.01, ...],
-    "gz": [0.00, -0.01, ...]
-}
-"""
 
 from __future__ import annotations
 
@@ -45,13 +10,15 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-# ─── Thresholds ───────────────────────────────────────────────────────────────
+# ─── Classification thresholds ───────────────────────────────────────────────
 TEMP_FEVER_THRESHOLD = 38.0   # °C
 BPM_HIGH_THRESHOLD = 120.0    # beats per minute
+BPM_LOW_THRESHOLD = 50.0      # beats per minute
 
 # ─── Result labels ────────────────────────────────────────────────────────────
 STATUS_FEVER = "FEVER"
 STATUS_HIGH_HEART_RATE = "HIGH_HEART_RATE"
+STATUS_LOW_HEART_RATE = "LOW_HEART_RATE"
 STATUS_NORMAL = "NORMAL"
 
 # ─── Batch parsing defaults ───────────────────────────────────────────────────
@@ -62,6 +29,7 @@ MIN_SPO2 = 70.0
 MAX_SPO2 = 100.0
 
 
+# ─── Data structures ──────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class HealthData:
     """Normalized telemetry data received from device/app."""
@@ -86,17 +54,12 @@ class HealthData:
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["status"] = self.status
-
-        # Preferred device keys.
         payload["bpm"] = int(round(payload["heart_rate"]))
         payload["ts"] = payload["timestamp"]
-
-        # Keep backward-compatible aliases for existing clients.
-        payload["timestamp"] = payload["timestamp"]
-        payload["heart_rate"] = payload["heart_rate"]
         return payload
 
 
+# ─── Primitive conversion helpers ────────────────────────────────────────────
 def _to_float(value: Any, field_name: str) -> float:
     try:
         return float(value)
@@ -141,6 +104,17 @@ def _to_optional_int_list(value: Any, field_name: str, expected_len: int) -> Lis
         raise ValueError(f"Truong '{field_name}' phai co {expected_len} phan tu")
 
     return [_to_int(item, field_name) for item in value]
+
+
+# ─── Signal helpers ──────────────────────────────────────────────────────────
+def _first_batch_list_length(payload: Dict[str, Any], keys: List[str]) -> int | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            if not value:
+                raise ValueError(f"Truong '{key}' khong duoc rong")
+            return len(value)
+    return None
 
 
 def _is_valid_vital(value: Any) -> bool:
@@ -214,8 +188,9 @@ def _estimate_spo2_from_ir_red(ir_values: List[int], red_values: List[int]) -> f
     return float(np.clip(spo2, MIN_SPO2, MAX_SPO2))
 
 
+# ─── Payload normalization ───────────────────────────────────────────────────
 def _is_batch_payload(payload: Dict[str, Any]) -> bool:
-    series_keys = ("ax", "ay", "az", "gx", "gy", "gz")
+    series_keys = ("ax", "ay", "az", "gx", "gy", "gz", "ir", "red")
     return any(isinstance(payload.get(key), list) for key in series_keys)
 
 
@@ -230,24 +205,64 @@ def _normalize_payload_aliases(payload: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _build_health_data_sample(
+    ax: float,
+    ay: float,
+    az: float,
+    gx: float,
+    gy: float,
+    gz: float,
+    heart_rate: float,
+    spo2: float | None,
+    temp: float,
+    ir: int | None,
+    red: int | None,
+    timestamp: int,
+) -> HealthData:
+    return HealthData(
+        ax=ax,
+        ay=ay,
+        az=az,
+        gx=gx,
+        gy=gy,
+        gz=gz,
+        heart_rate=heart_rate,
+        spo2=spo2,
+        temp=temp,
+        ir=ir,
+        red=red,
+        timestamp=timestamp,
+    )
+
+
+# ─── Public payload parsers ───────────────────────────────────────────────────
 def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     """Parse batch telemetry payload into a list of normalized samples."""
     normalized = _normalize_payload_aliases(payload)
 
-    required_series = ("ax", "ay", "az", "gx", "gy", "gz")
-    series_map: Dict[str, List[float]] = {}
-    for key in required_series:
-        if key not in normalized:
-            raise ValueError(f"Thieu truong bat buoc: {key}")
-        series_map[key] = _to_float_list(normalized[key], key)
+    batch_keys = ("ax", "ay", "az", "gx", "gy", "gz", "ir", "red")
+    sample_count = _first_batch_list_length(normalized, list(batch_keys))
+    if sample_count is None:
+        raise ValueError("Payload batch khong co truong mang nao hop le")
 
-    sample_count = len(series_map["ax"])
-    for key in required_series:
+    series_map: Dict[str, List[float]] = {}
+    for key in ("ax", "ay", "az", "gx", "gy", "gz"):
+        if key in normalized and normalized[key] is not None:
+            series_map[key] = _to_float_list(normalized[key], key)
+        else:
+            series_map[key] = [0.0] * sample_count
+
+    for key in ("ax", "ay", "az", "gx", "gy", "gz"):
         if len(series_map[key]) != sample_count:
             raise ValueError(f"Cac truong mang phai cung do dai, loi tai '{key}'")
 
-    ir_series = _to_optional_int_list(normalized.get("ir"), "ir", sample_count)
-    red_series = _to_optional_int_list(normalized.get("red"), "red", sample_count)
+    ir_series = None
+    if normalized.get("ir") is not None:
+        ir_series = _to_optional_int_list(normalized.get("ir"), "ir", sample_count)
+
+    red_series = None
+    if normalized.get("red") is not None:
+        red_series = _to_optional_int_list(normalized.get("red"), "red", sample_count)
 
     sample_interval_ms = _to_int(
         normalized.get("sample_interval_ms", DEFAULT_BATCH_SAMPLE_INTERVAL_MS),
@@ -256,10 +271,13 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     sample_interval_ms = max(1, sample_interval_ms)
 
     batch_end_timestamp = _to_int(
-        normalized.get("timestamp", int(time.time() * 1000)),
+        normalized.get("timestamp", normalized.get("ts", int(time.time() * 1000))),
         "timestamp",
     )
-    batch_start_timestamp = batch_end_timestamp - (sample_count - 1) * sample_interval_ms
+    if normalized.get("ts0") is not None:
+        batch_start_timestamp = _to_int(normalized["ts0"], "ts0")
+    else:
+        batch_start_timestamp = batch_end_timestamp - (sample_count - 1) * sample_interval_ms
 
     temp_value = _to_float(normalized.get("temp", 0.0), "temp")
 
@@ -282,7 +300,7 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     for idx in range(sample_count):
         sample_timestamp = batch_start_timestamp + idx * sample_interval_ms
         samples.append(
-            HealthData(
+            _build_health_data_sample(
                 ax=series_map["ax"][idx],
                 ay=series_map["ay"][idx],
                 az=series_map["az"][idx],
@@ -305,7 +323,10 @@ def from_dict(payload: Dict[str, Any]) -> HealthData:
     """Parse and validate telemetry payload from a Python dict."""
     normalized = _normalize_payload_aliases(payload)
 
-    # Older device payloads may not include gyroscope/timestamp.
+    # Older and simplified payloads may not include motion/optical fields.
+    normalized.setdefault("ax", 0.0)
+    normalized.setdefault("ay", 0.0)
+    normalized.setdefault("az", 0.0)
     normalized.setdefault("gx", 0.0)
     normalized.setdefault("gy", 0.0)
     normalized.setdefault("gz", 0.0)
@@ -315,12 +336,12 @@ def from_dict(payload: Dict[str, Any]) -> HealthData:
     normalized.setdefault("ir", None)
     normalized.setdefault("red", None)
 
-    required = ("ax", "ay", "az", "temp")
+    required = ("temp",)
     missing = [key for key in required if key not in normalized]
     if missing:
         raise ValueError(f"Thieu truong bat buoc: {', '.join(missing)}")
 
-    return HealthData(
+    return _build_health_data_sample(
         ax=_to_float(normalized["ax"], "ax"),
         ay=_to_float(normalized["ay"], "ay"),
         az=_to_float(normalized["az"], "az"),
@@ -358,10 +379,13 @@ def from_json_samples(raw: str) -> List[HealthData]:
     return [from_dict(payload)]
 
 
+# ─── Classification ──────────────────────────────────────────────────────────
 def classify(bpm: float, temp: float) -> str:
     """Classify health status based on BPM and body temperature."""
     if temp > TEMP_FEVER_THRESHOLD:
         return STATUS_FEVER
     if bpm > BPM_HIGH_THRESHOLD:
         return STATUS_HIGH_HEART_RATE
+    if bpm < BPM_LOW_THRESHOLD:
+        return STATUS_LOW_HEART_RATE
     return STATUS_NORMAL

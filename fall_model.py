@@ -22,24 +22,6 @@ AI_MODEL_PATH = str(Path(__file__).resolve().parent / AI_MODEL_NAME)
 AI_MEAN_PATH = str(Path(__file__).resolve().parent / "mean.npy")
 AI_STD_PATH = str(Path(__file__).resolve().parent / "std.npy")
 AI_THRESHOLD = float(os.getenv("AI_FALL_THRESHOLD", "0.6"))
-AI_REQUIRE_FULL_WINDOW = os.getenv("AI_REQUIRE_FULL_WINDOW", "true").lower() == "true"
-AI_ENABLE_EARLY_FALL = os.getenv("AI_ENABLE_EARLY_FALL", "true").lower() == "true"
-AI_EARLY_ACCEL_THRESHOLD = float(os.getenv("AI_EARLY_ACCEL_THRESHOLD", "2.8"))
-AI_EARLY_GYRO_THRESHOLD = float(os.getenv("AI_EARLY_GYRO_THRESHOLD", "4.8"))
-
-
-def _resolve_effective_window(required_window: int) -> int:
-    if AI_REQUIRE_FULL_WINDOW:
-        return required_window
-
-    raw = os.getenv("AI_INPUT_MAX_SAMPLES", str(required_window))
-    try:
-        requested = int(raw)
-    except ValueError:
-        requested = required_window
-
-    requested = max(1, requested)
-    return min(required_window, requested)
 
 
 @dataclass(frozen=True)
@@ -137,8 +119,7 @@ class PlaceholderAIFallModel(BaseFallModel):
         # Model was trained with shape (batch, timesteps, features).
         self._required_window = int(self._model.input_shape[1])
         self._feature_count = int(self._model.input_shape[2])
-        self._effective_window = _resolve_effective_window(self._required_window)
-        self._buffer: deque[np.ndarray] = deque(maxlen=self._effective_window)
+        self._buffer: deque[np.ndarray] = deque(maxlen=self._required_window)
 
         if self._feature_count != 11:
             raise RuntimeError(
@@ -177,34 +158,14 @@ class PlaceholderAIFallModel(BaseFallModel):
     def _build_window_for_inference(self) -> np.ndarray:
         window = np.array(self._buffer, dtype=np.float32)
 
-        # Optional fast mode: pad to model timesteps by repeating last row.
-        if not AI_REQUIRE_FULL_WINDOW and window.shape[0] < self._required_window:
-            pad_len = self._required_window - window.shape[0]
-            pad_row = window[-1:]
-            padding = np.repeat(pad_row, pad_len, axis=0)
-            window = np.vstack([window, padding])
-
         window = (window - self._mean) / (self._std + 1e-6)
         return window.reshape(1, self._required_window, self._feature_count)
-
-    @staticmethod
-    def _early_fall_detected(data: FallInput) -> bool:
-        accel_mag = float(np.sqrt(data.ax ** 2 + data.ay ** 2 + data.az ** 2))
-        gyro_mag = float(np.sqrt(data.gx ** 2 + data.gy ** 2 + data.gz ** 2))
-        return accel_mag >= AI_EARLY_ACCEL_THRESHOLD and gyro_mag >= AI_EARLY_GYRO_THRESHOLD
 
     def predict(self, data: FallInput) -> FallPrediction:
         feature_vec = self._build_feature_vector(data)
         self._buffer.append(feature_vec)
 
-        if len(self._buffer) < self._effective_window:
-            if AI_ENABLE_EARLY_FALL and self._early_fall_detected(data):
-                return FallPrediction(
-                    fall_detected=True,
-                    confidence=0.99,
-                    label="EARLY_FALL",
-                )
-
+        if len(self._buffer) < self._required_window:
             return FallPrediction(
                 fall_detected=False,
                 confidence=0.0,
