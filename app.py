@@ -45,6 +45,8 @@ _packet_lock = Lock()
 _history_lock = Lock()
 _fall_model_lock = Lock()
 _fall_model = None
+_mqtt_client = None
+_mqtt_client_lock = Lock()
 
 
 def _get_fall_model():
@@ -281,6 +283,9 @@ def on_message(client, userdata, msg):
     print("📌 Chu de:", msg.topic)
 
     try:
+        global _latest_packet
+        global _latest_raw_payload
+
         raw = msg.payload.decode()
         try:
             raw_payload = json.loads(raw)
@@ -290,7 +295,6 @@ def on_message(client, userdata, msg):
         if _is_fall_alert_payload(raw_payload, msg.topic):
             alert_packet = _build_fall_alert_packet(raw_payload, msg.topic)
             with _packet_lock:
-                global _latest_raw_payload
                 _latest_raw_payload = raw_payload
 
             _append_history(alert_packet)
@@ -315,13 +319,16 @@ def on_message(client, userdata, msg):
             latest_packet = packet
 
             with _packet_lock:
-                global _latest_packet
-                global _latest_raw_payload
                 _latest_packet = packet
                 _latest_raw_payload = normalized_raw_payload
 
             _append_history(packet)
             socketio.emit("health_update", packet)
+            
+            # If fall detected, send buzzer_on command to device
+            if packet.get("fall", {}).get("detected", False):
+                print(f"🚨 Te nga phat hien! Gui buzzer_on toi device.")
+                _send_device_command("buzzer_on", duration_ms=5000)
 
         if latest_packet is not None:
             print(
@@ -340,6 +347,29 @@ def on_message(client, userdata, msg):
         )
     except UnicodeDecodeError:
         print("❌ Khong giai ma duoc tin nhan")
+
+
+def _send_device_command(cmd: str, **kwargs):
+    """Send command to device via MQTT device/command topic."""
+    global _mqtt_client
+    if _mqtt_client is None:
+        print("⚠️ MQTT client not connected, cannot send command")
+        return
+    
+    payload = {"cmd": cmd, **kwargs}
+    try:
+        with _mqtt_client_lock:
+            result = _mqtt_client.publish(
+                "device/command",
+                json.dumps(payload),
+                qos=1
+            )
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"📤 Command sent: {cmd}")
+            else:
+                print(f"❌ Failed to send command: {result.rc}")
+    except Exception as exc:
+        print(f"❌ Error sending command: {exc}")
 
 
 def build_mqtt_client():
@@ -392,14 +422,16 @@ def get_health_history():
         "items": history,
     })
 def main():
-    client = build_mqtt_client()
+    global _mqtt_client
+    
+    _mqtt_client = build_mqtt_client()
     mqtt_started = False
 
     try:
         try:
             # Connect asynchronously so API can bind port immediately on cloud deploy.
-            client.connect_async(BROKER, MQTT_PORT)
-            client.loop_start()
+            _mqtt_client.connect_async(BROKER, MQTT_PORT)
+            _mqtt_client.loop_start()
             mqtt_started = True
             print("✅ MQTT loop da khoi dong (async)")
         except Exception as exc:
