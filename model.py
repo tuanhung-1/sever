@@ -131,7 +131,11 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
         return None
 
     signal = np.array(ir_values, dtype=np.float64)
-    if np.std(signal) < 1e-6:
+    signal_std = np.std(signal)
+    
+    # If signal has no variation, can't detect heartbeat
+    if signal_std < 100:
+        print(f"⚠️  IR signal co std = {signal_std:.2f} (qua thap, ko phat hien duoc nhip tim)")
         return None
 
     # Light smoothing to suppress sensor noise.
@@ -157,11 +161,13 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
             peaks[-1] = idx
 
     if len(peaks) < 2:
+        print(f"⚠️  Khong phat hien duoc peaks trong IR signal (found {len(peaks)} peaks)")
         return None
 
     rr_seconds = np.diff(peaks) / sample_rate_hz
     rr_seconds = rr_seconds[(rr_seconds > 0.25) & (rr_seconds < 2.0)]
     if rr_seconds.size == 0:
+        print(f"⚠️  Peak intervals ko hop le, ko tinh duoc BPM")
         return None
 
     bpm = 60.0 / float(np.median(rr_seconds))

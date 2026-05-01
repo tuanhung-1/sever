@@ -236,20 +236,27 @@ def _build_display_payload(normalized_data, fall_prediction):
 def _to_flutter_packet(health_data, source_topic):
     raw_data = health_data.to_dict()
     data = _normalize_health_data_for_frontend(raw_data)
-    model = _get_fall_model()
-    fall_input = FallInput(
-        ax=health_data.ax,
-        ay=health_data.ay,
-        az=health_data.az,
-        gx=health_data.gx,
-        gy=health_data.gy,
-        gz=health_data.gz,
-        heart_rate=health_data.heart_rate,
-        spo2=health_data.spo2 or 0.0,
-        temp=health_data.temp,
-        timestamp=health_data.timestamp,
-    )
-    fall_prediction = _format_fall_for_frontend(model.predict(fall_input).to_dict())
+    
+    # Only run fall detection on sensor/fall_raw (has motion data)
+    # sensor/data has no motion data, so fall should be false
+    fall_prediction = {"detected": False, "confidence": 0.0}
+    
+    if source_topic == "sensor/fall_raw":
+        model = _get_fall_model()
+        fall_input = FallInput(
+            ax=health_data.ax,
+            ay=health_data.ay,
+            az=health_data.az,
+            gx=health_data.gx,
+            gy=health_data.gy,
+            gz=health_data.gz,
+            heart_rate=health_data.heart_rate,
+            spo2=health_data.spo2 or 0.0,
+            temp=health_data.temp,
+            timestamp=health_data.timestamp,
+        )
+        fall_prediction = _format_fall_for_frontend(model.predict(fall_input).to_dict())
+    
     packet = {
         "type": "health_update",
         "source_topic": source_topic,
