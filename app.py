@@ -47,6 +47,8 @@ _fall_model_lock = Lock()
 _fall_model = None
 _mqtt_client = None
 _mqtt_client_lock = Lock()
+_current_temperature = 36.5  # Nhiệt độ cơ thể mặc định (lấy từ sensor/data)
+_temp_lock = Lock()
 
 
 def _get_fall_model():
@@ -175,6 +177,87 @@ def _build_fall_alert_packet(raw_payload, source_topic):
     }
 
 
+def _is_lstm_fall_raw_payload(raw_payload, topic):
+    """Kiểm tra xem payload có phải từ sensor/fall_raw (dữ liệu AI LSTM) không."""
+    if not isinstance(topic, str) or not isinstance(raw_payload, dict):
+        return False
+    if topic == "sensor/fall_raw":
+        return True
+    if raw_payload.get("event") == "fall_raw":
+        return True
+    return False
+
+
+def _process_lstm_raw_data(raw_payload, source_topic):
+    """Xử lý dữ liệu AI LSTM từ sensor/fall_raw (200 mẫu, 4 giây).
+    
+    Payload format:
+    {
+        "event": "fall_raw",
+        "trigger_ts": ...,
+        "ax": [val1, val2, ..., val200],
+        "ay": [...], "az": [...],
+        "gx": [...], "gy": [...], "gz": [...]
+    }
+    """
+    try:
+        model = _get_fall_model()
+        temp = _get_current_temperature()  # Lấy temp từ lần đo cuối
+        trigger_ts = raw_payload.get("trigger_ts", int(time.time() * 1000))
+        
+        # Kiểm tra xem có đủ dữ liệu motion không
+        required_keys = ["ax", "ay", "az", "gx", "gy", "gz"]
+        for key in required_keys:
+            if key not in raw_payload or not isinstance(raw_payload[key], list):
+                print(f"⚠️  Dữ liệu LSTM thiếu: {key}")
+                return None
+        
+        sample_count = len(raw_payload["ax"])
+        
+        # Kiểm tra tất cả mảng có độ dài bằng nhau không
+        for key in required_keys[1:]:
+            if len(raw_payload[key]) != sample_count:
+                print(f"⚠️  Dữ liệu LSTM không đồng nhất: {key} có {len(raw_payload[key])} mẫu, mong đợi {sample_count}")
+                return None
+        
+        # Xử lý từng mẫu thông qua model
+        fall_detected = False
+        max_confidence = 0.0
+        
+        print(f"🧠 [AI LSTM] Đang xử lý {sample_count} mẫu dữ liệu từ {source_topic}...")
+        
+        for idx in range(sample_count):
+            fall_input = FallInput(
+                ax=float(raw_payload["ax"][idx]),
+                ay=float(raw_payload["ay"][idx]),
+                az=float(raw_payload["az"][idx]),
+                gx=float(raw_payload["gx"][idx]),
+                gy=float(raw_payload["gy"][idx]),
+                gz=float(raw_payload["gz"][idx]),
+                heart_rate=0.0,  # Không có BPM từ LSTM data
+                spo2=0.0,        # Không có SpO2 từ LSTM data
+                temp=temp,       # Dùng temp hiện tại
+                timestamp=trigger_ts + idx * 20,  # 20ms interval (50Hz)
+            )
+            
+            prediction = model.predict(fall_input).to_dict()
+            if prediction.get("detected", False):
+                fall_detected = True
+                confidence = prediction.get("confidence", 0.0)
+                max_confidence = max(max_confidence, confidence)
+        
+        return {
+            "detected": fall_detected,
+            "confidence": max_confidence,
+            "sample_count": sample_count,
+            "trigger_ts": trigger_ts,
+        }
+    
+    except Exception as exc:
+        print(f"❌ Lỗi xử lý dữ liệu LSTM: {exc}")
+        return None
+
+
 def _normalize_health_data_for_frontend(raw_data):
     bpm = _to_non_negative_number(raw_data.get("bpm"))
     spo2 = _to_non_negative_number(raw_data.get("spo2"))
@@ -188,6 +271,22 @@ def _normalize_health_data_for_frontend(raw_data):
         "temp": round(temp, 2) if temp is not None else None,
         "status": raw_data.get("status", "NORMAL"),
     }
+
+
+def _get_current_temperature():
+    """Lấy nhiệt độ hiện tại (từ lần đo cuối từ sensor/data)."""
+    global _current_temperature
+    with _temp_lock:
+        return _current_temperature
+
+
+def _update_temperature(temp_value):
+    """Cập nhật nhiệt độ hiện tại từ sensor/data."""
+    global _current_temperature
+    numeric = _to_non_negative_number(temp_value)
+    if numeric is not None and 30.0 < numeric < 42.0:
+        with _temp_lock:
+            _current_temperature = numeric
 
 
 def _format_fall_for_frontend(fall_prediction):
@@ -299,6 +398,9 @@ def on_message(client, userdata, msg):
         except json.JSONDecodeError as exc:
             raise ValueError("Payload JSON khong hop le") from exc
 
+        # ────────────────────────────────────────────────────────────────
+        # [LUỒNG 1] SENSOR ALERT - Cảnh báo tức thời
+        # ────────────────────────────────────────────────────────────────
         if _is_fall_alert_payload(raw_payload, msg.topic):
             alert_packet = _build_fall_alert_packet(raw_payload, msg.topic)
             with _packet_lock:
@@ -307,11 +409,51 @@ def on_message(client, userdata, msg):
             _append_history(alert_packet)
             socketio.emit("sensor_alert", alert_packet)
             print(
-                f"🚨 Da nhan alert te nga tu {msg.topic} | total_g={alert_packet['data']['total_g']}"
+                f"🚨 [LUỒNG 1 - ALERT] Da nhan alert te nga tu {msg.topic} | total_g={alert_packet['data']['total_g']}"
             )
             return
 
+        # ────────────────────────────────────────────────────────────────
+        # [LUỒNG 2] SENSOR FALL_RAW - Dữ liệu AI LSTM (200 mẫu, 4 giây)
+        # ────────────────────────────────────────────────────────────────
+        if _is_lstm_fall_raw_payload(raw_payload, msg.topic):
+            print(f"🧠 [LUỒNG 2 - AI LSTM] Nhan du lieu tu {msg.topic}")
+            
+            lstm_result = _process_lstm_raw_data(raw_payload, msg.topic)
+            if lstm_result:
+                # Tạo packet AI dựa trên kết quả LSTM
+                ai_packet = {
+                    "type": "fall_lstm_result",
+                    "source_topic": msg.topic,
+                    "server_timestamp": int(time.time()),
+                    "data": {
+                        "detected": lstm_result["detected"],
+                        "confidence": round(lstm_result["confidence"], 3),
+                        "sample_count": lstm_result["sample_count"],
+                    },
+                }
+                
+                with _packet_lock:
+                    _latest_raw_payload = raw_payload
+
+                _append_history(ai_packet)
+                socketio.emit("ai_fall_result", ai_packet)
+                
+                if lstm_result["detected"]:
+                    print(f"🚨 [AI] Xác nhận TE NGA! Confidence: {lstm_result['confidence']:.3f}")
+                    _send_device_command("buzzer_on", duration_ms=5000)
+                else:
+                    print(f"✓ [AI] Không phải vấp ngã. Confidence: {lstm_result['confidence']:.3f}")
+            return
+
+        # ────────────────────────────────────────────────────────────────
+        # [LUỒNG 3] SENSOR DATA - Dữ liệu SpO2/BPM thường xuyên (1Hz)
+        # ────────────────────────────────────────────────────────────────
         normalized_raw_payload = _normalize_raw_payload_for_api(raw_payload)
+        
+        # Cập nhật temperature hiện tại từ sensor/data
+        _update_temperature(raw_payload.get("temp"))
+        
         health_samples = from_json_samples(raw)
 
         latest_packet = None
@@ -325,23 +467,21 @@ def on_message(client, userdata, msg):
             packet["data"]["status"] = status
             latest_packet = packet
 
+        if latest_packet is not None:
             with _packet_lock:
-                _latest_packet = packet
+                _latest_packet = latest_packet
                 _latest_raw_payload = normalized_raw_payload
 
-            _append_history(packet)
-            socketio.emit("health_update", packet)
-            
-            # If fall detected, send buzzer_on command to device
-            if packet.get("fall", {}).get("detected", False):
-                print(f"🚨 Te nga phat hien! Gui buzzer_on toi device.")
-                _send_device_command("buzzer_on", duration_ms=5000)
+            # Save and push only the final packet for each MQTT message.
+            _append_history(latest_packet)
+            socketio.emit("health_update", latest_packet)
 
-        if latest_packet is not None:
             print(
-                f"📊 Da xu ly {len(health_samples)} mau | "
-                f"fall={latest_packet['fall']['detected']} conf={latest_packet['fall']['confidence']}"
+                f"💓 [LUỒNG 3 - SENSOR] Da xu ly {len(health_samples)} mau tu {msg.topic} | "
+                f"BPM={latest_packet['data']['bpm']} SpO2={latest_packet['data']['spo2']}% "
+                f"Temp={latest_packet['data']['temp']}°C"
             )
+            
     except ValueError as exc:
         print("❌ Payload khong hop le:", exc)
         socketio.emit(
