@@ -5,18 +5,21 @@ import time
 import os
 import json
 import traceback
+import struct
 from threading import Lock
+
+import numpy as np
 
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
 
-from fall_model import FallInput, create_fall_model
-from model import from_json_samples, classify
+from fall_model import create_fall_model
+from model import from_json_samples, classify, STATUS_FALL_DETECTED
 
-BROKER = "dfee921e5f16440e8f3892ed3564c06d.s1.eu.hivemq.cloud"
+BROKER = "11060dbd13b54fc988ae8f9bfc43c089.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
-USERNAME = "hungdaica123"
-PASSWORD = "Hungpro123"
+USERNAME = "heart-rate"
+PASSWORD = "aB123456"
 CLIENT_ID = "python_backend"
 MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
@@ -49,6 +52,11 @@ _mqtt_client = None
 _mqtt_client_lock = Lock()
 _current_temperature = 36.5  # Nhiệt độ cơ thể mặc định (lấy từ sensor/data)
 _temp_lock = Lock()
+
+# ── Trạng thái luồng Alert → Fall_Raw ────────────────────────────────────────
+_waiting_for_fall_raw = False      # Chờ dữ liệu fall_raw sau alert
+_pending_alert_data = None         # Lưu alert data để match với fall_raw
+_fall_raw_state_lock = Lock()      # Bảo vệ trạng thái
 
 
 def _get_fall_model():
@@ -129,6 +137,208 @@ def _normalize_series_field(value, field_name, as_int=False):
     return normalized
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Decoder Binary Fall_Raw từ ESP32 v6
+# ══════════════════════════════════════════════════════════════════════════════
+def _decode_fall_raw_binary(buf: bytes) -> dict | None:
+    """
+    Decode binary fall_raw payload từ ESP32 v6 (symmetric window).
+    
+    Format:
+      - 4 bytes: uint32 BE - trigger_ts (ms khi peak được detect)
+      - 2 bytes: uint16 BE - num_samples (150 hoặc 75)
+      - 1 byte: uint8 - pre_samples (100 hoặc 60, chỉ số của peak trong window)
+      - 1 byte: uint8 - reason length (N)
+      - N bytes: reason string (trigger trigger lý do)
+      - M*16 bytes: samples (M = num_samples, mỗi sample = 8*int16)
+           channels: ax, ay, az, gx, gy, gz, magnitude, jerk
+    
+    Returns:
+      dict với: trigger_ts, num_samples, pre_samples, reason, data (np.ndarray)
+      hoặc None nếu decode fail
+    """
+    try:
+        if len(buf) < 8:
+            print(f"⚠️  Buffer quá nhỏ: {len(buf)} < 8 bytes")
+            return None
+        
+        offset = 0
+        ts = struct.unpack_from('>I', buf, offset)[0]
+        offset += 4
+        num_samples = struct.unpack_from('>H', buf, offset)[0]
+        offset += 2
+        pre_samples = buf[offset]
+        offset += 1
+        reason_len = buf[offset]
+        offset += 1
+        
+        if offset + reason_len > len(buf):
+            print(f"⚠️  Không đủ buffer cho reason string")
+            return None
+        
+        reason = buf[offset:offset+reason_len].decode('utf-8', errors='replace')
+        offset += reason_len
+        
+        # Decode samples: 8 channels × int16 per sample = 16 bytes/sample
+        samples = np.zeros((num_samples, 8), dtype=np.float32)
+        
+        SCALE_ACC = 1000.0
+        SCALE_GYRO = 10.0
+        SCALE_MAG = 1000.0
+        SCALE_JERK = 1000.0
+        
+        for i in range(num_samples):
+            if offset + 16 > len(buf):
+                print(f"⚠️  Buffer không đủ tại sample {i}/{num_samples}")
+                return None
+            
+            raw = struct.unpack_from('>8h', buf, offset)
+            offset += 16
+            
+            samples[i, 0] = raw[0] / SCALE_ACC    # ax
+            samples[i, 1] = raw[1] / SCALE_ACC    # ay
+            samples[i, 2] = raw[2] / SCALE_ACC    # az
+            samples[i, 3] = raw[3] / SCALE_GYRO   # gx
+            samples[i, 4] = raw[4] / SCALE_GYRO   # gy
+            samples[i, 5] = raw[5] / SCALE_GYRO   # gz
+            samples[i, 6] = raw[6] / SCALE_MAG    # magnitude G
+            samples[i, 7] = raw[7] / SCALE_JERK   # jerk
+        
+        print(f"✅ Decode binary: {num_samples} samples × 8 channels | peak_idx={pre_samples} | reason='{reason}'")
+        
+        return {
+            'trigger_ts': ts,
+            'num_samples': num_samples,
+            'pre_samples': pre_samples,  # Peak index trong window
+            'reason': reason,
+            'data': samples  # shape (num_samples, 8)
+        }
+    
+    except Exception as e:
+        print(f"❌ Lỗi decode binary fall_raw: {e}")
+        traceback.print_exc()
+        return None
+
+
+def _pad_samples_to_lstm_window(samples: np.ndarray, target_size: int = 150) -> np.ndarray:
+    """
+    Pad mẫu từ size hiện tại lên target_size (mặc định 150).
+    Nếu samples đã là 150, trả về không thay đổi.
+    Nếu là 75, nhân đôi mỗi mẫu để có 150.
+    
+    Args:
+        samples: shape (num_samples, 8)
+        target_size: kích thước mục tiêu (mặc định 150)
+    
+    Returns:
+        padded array shape (target_size, 8)
+    """
+    current_size = samples.shape[0]
+    
+    if current_size == target_size:
+        return samples
+    
+    # Nếu cần 150 từ 75: nhân đôi mỗi mẫu
+    if current_size * 2 == target_size:
+        return np.repeat(samples, 2, axis=0)
+    
+    # Fallback: linear interpolation
+    indices_old = np.linspace(0, current_size - 1, current_size)
+    indices_new = np.linspace(0, current_size - 1, target_size)
+    padded = np.zeros((target_size, 8), dtype=np.float32)
+    
+    for ch in range(8):
+        padded[:, ch] = np.interp(indices_new, indices_old, samples[:, ch])
+    
+    return padded
+
+
+def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict | None:
+    """
+    Xử lý dữ liệu fall_raw qua model.h5 để detect ngã.
+    
+    Model yêu cầu 11 features: [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
+    Fall_raw binary có 8 channels: [ax, ay, az, gx, gy, gz, magnitude, jerk]
+    
+    Args:
+        decoded_data: dict từ _decode_fall_raw_binary()
+          - data: np.ndarray (num_samples, 8) → [ax, ay, az, gx, gy, gz, mag, jerk]
+          - num_samples: int
+          - pre_samples: int
+          - reason: str
+          - trigger_ts: int
+        alert_data: dict từ alert payload
+    
+    Returns:
+        dict với detected, confidence, num_samples, reason
+        hoặc None nếu lỗi
+    """
+    try:
+        model = _get_fall_model()
+        
+        samples_array = decoded_data['data']      # shape (75 hoặc 150, 8)
+        num_samples = decoded_data['num_samples']
+        reason = decoded_data['reason']
+        trigger_ts = decoded_data['trigger_ts']
+        pre_samples = decoded_data['pre_samples']
+        
+        # Pad nếu cần: 75 → 150
+        if num_samples != model._required_window:
+            print(f"⚠️  Padding: {num_samples} → {model._required_window}")
+            samples_array = _pad_samples_to_lstm_window(samples_array, model._required_window)
+        
+        # ── Build 11-feature vector từ 8-channel raw data ──────────────────────
+        # Model train với: [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
+        # Binary có: [ax, ay, az, gx, gy, gz, magnitude, jerk] → tính roll, pitch
+        temp = _get_current_temperature()
+        
+        features_array = np.zeros((samples_array.shape[0], 11), dtype=np.float32)
+        
+        for i in range(samples_array.shape[0]):
+            ax, ay, az = samples_array[i, 0], samples_array[i, 1], samples_array[i, 2]
+            gx, gy, gz = samples_array[i, 3], samples_array[i, 4], samples_array[i, 5]
+            
+            # Tính roll, pitch từ acceleration (gyroscope-independent)
+            roll = np.arctan2(ay, az + 1e-6)
+            pitch = np.arctan2(-ax, np.sqrt(ay**2 + az**2) + 1e-6)
+            
+            # 11 features: [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
+            features_array[i] = [ax, ay, az, gx, gy, gz, roll, pitch, 0.0, 0.0, temp]
+        
+        # Normalize: (X - mean) / (std + eps)
+        mean = model._mean
+        std = model._std
+        normalized = (features_array - mean) / (std + 1e-6)
+        
+        # Reshape để inference: (1, num_timesteps, 11)
+        X = normalized[np.newaxis, ...]  # (1, num_samples, 11)
+        
+        # Inference
+        pred = model._model.predict(X, verbose=0)  # output shape: (1, 1)
+        confidence = float(pred[0][0])
+        
+        # Threshold từ model (mặc định 0.6)
+        threshold = float(os.getenv("AI_FALL_THRESHOLD", "0.6"))
+        detected = confidence >= threshold
+        
+        print(f"🧠 [MODEL] Features=11 | Inference: confidence={confidence:.3f}, threshold={threshold} → detected={detected}")
+        
+        return {
+            'detected': detected,
+            'confidence': round(confidence, 3),
+            'num_samples': num_samples,
+            'pre_samples': pre_samples,
+            'trigger_ts': trigger_ts,
+            'reason': reason,
+            'alert_trigger': alert_data.get("trigger", alert_data.get("message", "unknown")),
+        }
+    
+    except Exception as e:
+        print(f"❌ Lỗi xử lý fall_raw qua model: {e}")
+        traceback.print_exc()
+        return None
+
+
 def _normalize_raw_payload_for_api(raw_payload):
     if not isinstance(raw_payload, dict):
         raise ValueError("Payload khong hop le, can doi tuong JSON")
@@ -151,111 +361,6 @@ def _normalize_raw_payload_for_api(raw_payload):
         "gy": _normalize_series_field(raw_payload.get("gy"), "gy"),
         "gz": _normalize_series_field(raw_payload.get("gz"), "gz"),
     }
-
-
-def _is_fall_alert_payload(raw_payload, topic):
-    if isinstance(topic, str) and topic.endswith("/alert"):
-        return True
-    if not isinstance(raw_payload, dict):
-        return False
-    return raw_payload.get("type") == "fall_alert" or raw_payload.get("event") == "fall_alert"
-
-
-def _build_fall_alert_packet(raw_payload, source_topic):
-    total_g = _to_number(raw_payload.get("total_g"))
-    ts = raw_payload.get("ts", raw_payload.get("timestamp"))
-
-    return {
-        "type": "fall_alert",
-        "source_topic": source_topic,
-        "server_timestamp": int(time.time()),
-        "data": {
-            "ts": int(ts) if ts is not None else None,
-            "total_g": round(total_g, 2) if total_g is not None else None,
-            "message": raw_payload.get("message", "fall_detected"),
-        },
-    }
-
-
-def _is_lstm_fall_raw_payload(raw_payload, topic):
-    """Kiểm tra xem payload có phải từ sensor/fall_raw (dữ liệu AI LSTM) không."""
-    if not isinstance(topic, str) or not isinstance(raw_payload, dict):
-        return False
-    if topic == "sensor/fall_raw":
-        return True
-    if raw_payload.get("event") == "fall_raw":
-        return True
-    return False
-
-
-def _process_lstm_raw_data(raw_payload, source_topic):
-    """Xử lý dữ liệu AI LSTM từ sensor/fall_raw (200 mẫu, 4 giây).
-    
-    Payload format:
-    {
-        "event": "fall_raw",
-        "trigger_ts": ...,
-        "ax": [val1, val2, ..., val200],
-        "ay": [...], "az": [...],
-        "gx": [...], "gy": [...], "gz": [...]
-    }
-    """
-    try:
-        model = _get_fall_model()
-        temp = _get_current_temperature()  # Lấy temp từ lần đo cuối
-        trigger_ts = raw_payload.get("trigger_ts", int(time.time() * 1000))
-        
-        # Kiểm tra xem có đủ dữ liệu motion không
-        required_keys = ["ax", "ay", "az", "gx", "gy", "gz"]
-        for key in required_keys:
-            if key not in raw_payload or not isinstance(raw_payload[key], list):
-                print(f"⚠️  Dữ liệu LSTM thiếu: {key}")
-                return None
-        
-        sample_count = len(raw_payload["ax"])
-        
-        # Kiểm tra tất cả mảng có độ dài bằng nhau không
-        for key in required_keys[1:]:
-            if len(raw_payload[key]) != sample_count:
-                print(f"⚠️  Dữ liệu LSTM không đồng nhất: {key} có {len(raw_payload[key])} mẫu, mong đợi {sample_count}")
-                return None
-        
-        # Xử lý từng mẫu thông qua model
-        fall_detected = False
-        max_confidence = 0.0
-        
-        print(f"🧠 [AI LSTM] Đang xử lý {sample_count} mẫu dữ liệu từ {source_topic}...")
-        
-        for idx in range(sample_count):
-            fall_input = FallInput(
-                ax=float(raw_payload["ax"][idx]),
-                ay=float(raw_payload["ay"][idx]),
-                az=float(raw_payload["az"][idx]),
-                gx=float(raw_payload["gx"][idx]),
-                gy=float(raw_payload["gy"][idx]),
-                gz=float(raw_payload["gz"][idx]),
-                heart_rate=0.0,  # Không có BPM từ LSTM data
-                spo2=0.0,        # Không có SpO2 từ LSTM data
-                temp=temp,       # Dùng temp hiện tại
-                timestamp=trigger_ts + idx * 20,  # 20ms interval (50Hz)
-            )
-            
-            prediction = model.predict(fall_input).to_dict()
-            if prediction.get("detected", False):
-                fall_detected = True
-                confidence = prediction.get("confidence", 0.0)
-                max_confidence = max(max_confidence, confidence)
-        
-        return {
-            "detected": fall_detected,
-            "confidence": max_confidence,
-            "sample_count": sample_count,
-            "trigger_ts": trigger_ts,
-        }
-    
-    except Exception as exc:
-        print(f"❌ Lỗi xử lý dữ liệu LSTM: {exc}")
-        return None
 
 
 def _normalize_health_data_for_frontend(raw_data):
@@ -287,17 +392,6 @@ def _update_temperature(temp_value):
     if numeric is not None and 30.0 < numeric < 42.0:
         with _temp_lock:
             _current_temperature = numeric
-
-
-def _format_fall_for_frontend(fall_prediction):
-    detected = bool(fall_prediction.get("detected", False))
-    confidence = _to_number(fall_prediction.get("confidence"))
-    confidence = 0.0 if confidence is None else max(0.0, min(1.0, confidence))
-    
-    return {
-        "detected": detected,
-        "confidence": round(confidence, 3),
-    }
 
 
 def _build_display_payload(normalized_data, fall_prediction):
@@ -332,41 +426,67 @@ def _build_display_payload(normalized_data, fall_prediction):
     }
 
 
+def _build_health_update_with_fall(fall_result: dict) -> dict | None:
+    """
+    Tạo health_update packet kết hợp fall detection result + health vitals cuối cùng.
+    Đảm bảo fall detection được ghi kèm theo tình trạng sức khỏe.
+    
+    Hòa nhập:
+    - Fall detection (AI model confidence)
+    - Latest vitals (BPM, SpO2, Temp, Status)
+    - Alert trigger reason
+    
+    Returns health_update packet hoặc None nếu không có vitals
+    """
+    with _packet_lock:
+        if _latest_packet is None:
+            print("⚠️  Không có health vitals để kết hợp với fall detection")
+            return None
+        
+        # Clone packet cuối cùng
+        latest = _latest_packet.copy()
+        
+        # Merge fall detection result vào data
+        latest["data"]["fall"] = {
+            "detected": fall_result.get("detected", False),
+            "confidence": fall_result.get("confidence", 0.0),
+            "trigger": fall_result.get("alert_trigger", "unknown"),
+            "reason": fall_result.get("reason", ""),
+        }
+        
+        # Update status nếu fall detected
+        if fall_result.get("detected"):
+            latest["data"]["status"] = STATUS_FALL_DETECTED
+        
+        # Metadata từ fall detection
+        latest["fall_detection"] = {
+            "timestamp": fall_result.get("trigger_ts"),
+            "num_samples": fall_result.get("num_samples"),
+            "pre_samples": fall_result.get("pre_samples"),
+            "model_version": "LSTM_v6",
+        }
+        
+        latest["server_timestamp"] = int(time.time())
+        
+        return latest
+
+
 def _to_flutter_packet(health_data, source_topic):
+    """Build health_update packet from health_data."""
     raw_data = health_data.to_dict()
     data = _normalize_health_data_for_frontend(raw_data)
-    
-    # Only run fall detection on sensor/fall_raw (has motion data)
-    # sensor/data has no motion data, so fall should be false
-    fall_prediction = {"detected": False, "confidence": 0.0}
-    
-    if source_topic == "sensor/fall_raw":
-        model = _get_fall_model()
-        fall_input = FallInput(
-            ax=health_data.ax,
-            ay=health_data.ay,
-            az=health_data.az,
-            gx=health_data.gx,
-            gy=health_data.gy,
-            gz=health_data.gz,
-            heart_rate=health_data.heart_rate,
-            spo2=health_data.spo2 or 0.0,
-            temp=health_data.temp,
-            timestamp=health_data.timestamp,
-        )
-        fall_prediction = _format_fall_for_frontend(model.predict(fall_input).to_dict())
     
     packet = {
         "type": "health_update",
         "source_topic": source_topic,
         "server_timestamp": int(time.time()),
         "data": data,
-        "fall": fall_prediction,
+        "fall": {"detected": False, "confidence": 0.0},
     }
 
     if API_VERBOSE_OUTPUT:
         packet["data_raw"] = raw_data
-        packet["display"] = _build_display_payload(raw_data, fall_prediction)
+        packet["display"] = _build_display_payload(raw_data, {})
 
     return packet
 
@@ -391,64 +511,104 @@ def on_message(client, userdata, msg):
     try:
         global _latest_packet
         global _latest_raw_payload
+        global _waiting_for_fall_raw
+        global _pending_alert_data
 
+        # ════════════════════════════════════════════════════════════════════════════════
+        # [LUỒNG 1] SENSOR ALERT - Cảnh báo tức thời từ ESP32
+        # ════════════════════════════════════════════════════════════════════════════════
+        if msg.topic == "sensor/alert":
+            print("🚨 [ALERT] Nhận cảnh báo từ sensor → chờ dữ liệu fall_raw...")
+            try:
+                raw = msg.payload.decode()
+                alert_payload = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                print(f"⚠️  Alert payload không phải JSON: {e}")
+                return
+            
+            with _fall_raw_state_lock:
+                _waiting_for_fall_raw = True
+                _pending_alert_data = alert_payload
+            
+            alert_packet = {
+                "type": "fall_alert",
+                "source_topic": msg.topic,
+                "server_timestamp": int(time.time()),
+                "data": {
+                    "ts": alert_payload.get("ts", alert_payload.get("trigger")),
+                    "trigger": alert_payload.get("trigger", "unknown"),
+                    "peak_g": alert_payload.get("peak_g"),
+                    "delta_g": alert_payload.get("delta_g"),
+                },
+            }
+            
+            _append_history(alert_packet)
+            socketio.emit("sensor_alert", alert_packet)
+            print(f"🚨 [ALERT] Ghi lại cảnh báo | trigger={alert_payload.get('trigger')} | chờ tối đa 10 giây")
+            return
+
+        # ════════════════════════════════════════════════════════════════════════════════
+        # [LUỒNG 2] SENSOR FALL_RAW - Dữ liệu binary từ ESP32 v6 (symmetric window)
+        # ════════════════════════════════════════════════════════════════════════════════
+        if msg.topic == "sensor/fall_raw":
+            with _fall_raw_state_lock:
+                if not _waiting_for_fall_raw:
+                    print("⚠️  Nhận fall_raw nhưng không có alert trước đó → bỏ qua")
+                    return
+                
+                _waiting_for_fall_raw = False
+                pending_alert = _pending_alert_data
+                _pending_alert_data = None
+            
+            # Decode binary payload (75 hoặc 150 samples × 8 channels)
+            decoded = _decode_fall_raw_binary(msg.payload)
+            if not decoded:
+                print("❌ Không thể decode fall_raw binary")
+                return
+            
+            # ────────────────────────────────────────────────────────────────────────────
+            # [KỲ 1] Xử lý dữ liệu qua model.h5 (AI LSTM Inference)
+            # ────────────────────────────────────────────────────────────────────────────
+            print(f"🧠 [AI INFERENCE] Đang xử lý {decoded['num_samples']} samples qua model.h5...")
+            result = _process_fall_raw_with_model(decoded, pending_alert)
+            
+            if result:
+                if result['detected']:
+                    print(f"🚨 [RESULT] ✅ TẾ NGÃ XÁC NHẬN! | Confidence: {result['confidence']:.3f}")
+                else:
+                    print(f"✓ [RESULT] Không phải ngã | Confidence: {result['confidence']:.3f}")
+                
+                # ────────────────────────────────────────────────────────────────────────
+                # [KỲ 2] Kết hợp fall detection + health vitals → health_update (CHỈ 1 RESPONSE)
+                # ────────────────────────────────────────────────────────────────────────
+                health_with_fall = _build_health_update_with_fall(result)
+                
+                if health_with_fall:
+                    # 💓 Gửi MỘT response duy nhất: health_update (kết hợp fall + vitals)
+                    _append_history(health_with_fall)
+                    socketio.emit("health_update", health_with_fall)
+                    
+                    fall_status = "TE_NGA" if result['detected'] else "NO_FALL"
+                    print(f"💓 [RESPONSE] {fall_status} | BPM={health_with_fall['data'].get('bpm')} "
+                          f"SpO2={health_with_fall['data'].get('spo2')}% Temp={health_with_fall['data'].get('temp')}°C")
+                    
+                    # Nếu ngã được xác nhận → kích hoạt cảnh báo trên thiết bị
+                    if result['detected']:
+                        _send_device_command("buzzer_on", duration_ms=5000)
+                else:
+                    print("⚠️  Không thể kết hợp fall detection với health vitals")
+            
+            return
+
+        # ════════════════════════════════════════════════════════════════════════════════
+        # [LUỒNG 3] SENSOR DATA - Dữ liệu SpO2/BPM thường xuyên (JSON)
+        # ════════════════════════════════════════════════════════════════════════════════
         raw = msg.payload.decode()
         try:
             raw_payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise ValueError("Payload JSON khong hop le") from exc
 
-        # ────────────────────────────────────────────────────────────────
-        # [LUỒNG 1] SENSOR ALERT - Cảnh báo tức thời
-        # ────────────────────────────────────────────────────────────────
-        if _is_fall_alert_payload(raw_payload, msg.topic):
-            alert_packet = _build_fall_alert_packet(raw_payload, msg.topic)
-            with _packet_lock:
-                _latest_raw_payload = raw_payload
-
-            _append_history(alert_packet)
-            socketio.emit("sensor_alert", alert_packet)
-            print(
-                f"🚨 [LUỒNG 1 - ALERT] Da nhan alert te nga tu {msg.topic} | total_g={alert_packet['data']['total_g']}"
-            )
-            return
-
-        # ────────────────────────────────────────────────────────────────
-        # [LUỒNG 2] SENSOR FALL_RAW - Dữ liệu AI LSTM (200 mẫu, 4 giây)
-        # ────────────────────────────────────────────────────────────────
-        if _is_lstm_fall_raw_payload(raw_payload, msg.topic):
-            print(f"🧠 [LUỒNG 2 - AI LSTM] Nhan du lieu tu {msg.topic}")
-            
-            lstm_result = _process_lstm_raw_data(raw_payload, msg.topic)
-            if lstm_result:
-                # Tạo packet AI dựa trên kết quả LSTM
-                ai_packet = {
-                    "type": "fall_lstm_result",
-                    "source_topic": msg.topic,
-                    "server_timestamp": int(time.time()),
-                    "data": {
-                        "detected": lstm_result["detected"],
-                        "confidence": round(lstm_result["confidence"], 3),
-                        "sample_count": lstm_result["sample_count"],
-                    },
-                }
-                
-                with _packet_lock:
-                    _latest_raw_payload = raw_payload
-
-                _append_history(ai_packet)
-                socketio.emit("ai_fall_result", ai_packet)
-                
-                if lstm_result["detected"]:
-                    print(f"🚨 [AI] Xác nhận TE NGA! Confidence: {lstm_result['confidence']:.3f}")
-                    _send_device_command("buzzer_on", duration_ms=5000)
-                else:
-                    print(f"✓ [AI] Không phải vấp ngã. Confidence: {lstm_result['confidence']:.3f}")
-            return
-
-        # ────────────────────────────────────────────────────────────────
-        # [LUỒNG 3] SENSOR DATA - Dữ liệu SpO2/BPM thường xuyên (1Hz)
-        # ────────────────────────────────────────────────────────────────
         normalized_raw_payload = _normalize_raw_payload_for_api(raw_payload)
         
         # Cập nhật temperature hiện tại từ sensor/data

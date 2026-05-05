@@ -178,15 +178,22 @@ class PlaceholderAIFallModel(BaseFallModel):
         )
 
 
-def create_fall_model(use_ai: bool = False) -> BaseFallModel:
+def create_fall_model(use_ai: bool = True) -> BaseFallModel:
     """
     Factory for selecting model implementation.
 
-    - use_ai=False: run test pipeline with RuleBasedFallModel.
-    - use_ai=True : use your AI model at AI_MODEL_PATH.
+    - use_ai=True (default): use the trained AI model (LSTM+CNN) from model.h5
+    - use_ai=False: fallback to RuleBasedFallModel for testing
     """
     if use_ai:
-        return PlaceholderAIFallModel(model_path=AI_MODEL_PATH)
+        try:
+            model = PlaceholderAIFallModel(model_path=AI_MODEL_PATH)
+            print(f"✅ Loaded AI Fall Model from {AI_MODEL_PATH}")
+            return model
+        except Exception as e:
+            print(f"⚠️  Could not load AI model ({e}). Falling back to RuleBasedFallModel")
+            return RuleBasedFallModel()
+    
     return RuleBasedFallModel()
 
 

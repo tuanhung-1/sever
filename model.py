@@ -11,14 +11,24 @@ from typing import Any, Dict, List
 import numpy as np
 
 # ─── Classification thresholds ───────────────────────────────────────────────
-TEMP_FEVER_THRESHOLD = 38.0   # °C
-BPM_HIGH_THRESHOLD = 120.0    # beats per minute
-BPM_LOW_THRESHOLD = 50.0      # beats per minute
+# Temperature (theo MAX30205 datasheet + lâm sàng)
+TEMP_FEVER_THRESHOLD = 37.5   # °C - Sốt (công thức)
+TEMP_DANGER_THRESHOLD = 35.0  # °C - Hypothermia (nguy hiểm)
+
+# Heart Rate (theo công thức)
+BPM_HIGH_THRESHOLD = 120.0    # beats per minute - Nguy hiểm
+BPM_LOW_THRESHOLD = 50.0      # beats per minute - Thấp
+BPM_DELTA_THRESHOLD = 20.0    # Δ BPM > 20 → Bất thường
+
+# SpO₂ (độ bão hòa oxy)
+SPO2_WARNING_THRESHOLD = 95.0  # % - Cảnh báo
+SPO2_DANGER_THRESHOLD = 90.0   # % - Nguy hiểm
 
 # ─── Result labels ────────────────────────────────────────────────────────────
 STATUS_FEVER = "FEVER"
 STATUS_HIGH_HEART_RATE = "HIGH_HEART_RATE"
 STATUS_LOW_HEART_RATE = "LOW_HEART_RATE"
+STATUS_FALL_DETECTED = "FALL_DETECTED"  # ← Trạng thái mới (ngã phát hiện)
 STATUS_NORMAL = "NORMAL"
 
 # ─── Batch parsing defaults ───────────────────────────────────────────────────
@@ -175,21 +185,36 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
 
 
 def _estimate_spo2_from_ir_red(ir_values: List[int], red_values: List[int]) -> float | None:
+    """
+    Estimate SpO2 using AC/DC method.
+    
+    Công thức:
+      DC = mean(signal)
+      AC = RMS(signal - DC) = sqrt(mean((signal - DC)²))
+      SpO₂ = 110 - 25 × (AC_red/DC_red) / (AC_ir/DC_ir)
+    """
     if len(ir_values) < 20 or len(red_values) < 20:
         return None
 
     ir = np.array(ir_values, dtype=np.float64)
     red = np.array(red_values, dtype=np.float64)
 
+    # DC: giá trị trung bình
     ir_dc = float(np.mean(ir))
     red_dc = float(np.mean(red))
-    ir_ac = float(np.std(ir))
-    red_ac = float(np.std(red))
+    
+    # AC: RMS (root mean square) của dao động
+    # AC = RMS(signal - DC) = sqrt(mean((signal-DC)²))
+    ir_ac = float(np.sqrt(np.mean((ir - ir_dc) ** 2)))  # RMS, không phải std
+    red_ac = float(np.sqrt(np.mean((red - red_dc) ** 2)))  # RMS, không phải std
 
     if ir_dc <= 1e-6 or red_dc <= 1e-6 or ir_ac <= 1e-6:
         return None
 
+    # Ratio: (AC_red/DC_red) / (AC_ir/DC_ir)
     ratio = (red_ac / red_dc) / (ir_ac / ir_dc)
+    
+    # SpO₂ công thức
     spo2 = 110.0 - 25.0 * ratio
     return float(np.clip(spo2, MIN_SPO2, MAX_SPO2))
 
@@ -239,6 +264,48 @@ def _build_health_data_sample(
         red=red,
         timestamp=timestamp,
     )
+
+
+# ─── Temperature filtering ──────────────────────────────────────────────────
+# Median filter: T = median(T_{i-2}, T_{i-1}, T_i)
+# EMA (Exponential Moving Average): T_smooth = 0.3T + 0.7T_old
+
+_last_temperature = 36.5
+_temperature_lock = None  # Will be set by app.py if needed
+
+def _median_filter_temperature(temps: List[float]) -> float:
+    """
+    Median filter: T = median(T_{i-2}, T_{i-1}, T_i)
+    
+    Input: List of temperatures (up to 3 values)
+    Output: Median value (smoothed)
+    """
+    if not temps:
+        return 36.5
+    return float(np.median(np.array(temps, dtype=np.float64)))
+
+
+def _ema_smooth_temperature(temp_new: float, temp_old: float = None, alpha: float = 0.3) -> float:
+    """
+    EMA (Exponential Moving Average): T_smooth = α×T_new + (1-α)×T_old
+    
+    Args:
+        temp_new: Mẫu nhiệt độ mới từ MAX30205
+        temp_old: Giá trị EMA trước đó (default: từ _last_temperature)
+        alpha: Smooth factor (default: 0.3)
+    
+    Returns:
+        Giá trị nhiệt độ đã làm mượt
+    """
+    global _last_temperature
+    
+    if temp_old is None:
+        temp_old = _last_temperature
+    
+    temp_smooth = alpha * temp_new + (1 - alpha) * temp_old
+    _last_temperature = temp_smooth
+    
+    return temp_smooth
 
 
 # ─── Public payload parsers ───────────────────────────────────────────────────
@@ -387,11 +454,23 @@ def from_json_samples(raw: str) -> List[HealthData]:
 
 # ─── Classification ──────────────────────────────────────────────────────────
 def classify(bpm: float, temp: float) -> str:
-    """Classify health status based on BPM and body temperature."""
+    """
+    Classify health status based on BPM and body temperature.
+    
+    Thresholds (công thức):
+    - Temperature: > 37.5°C (FEVER) | < 35°C (Hypothermia - nguy hiểm)
+    - BPM: > 120 (HIGH) | < 50 (LOW)
+    """
+    # Kiểm tra nhiệt độ (ưu tiên)
     if temp > TEMP_FEVER_THRESHOLD:
         return STATUS_FEVER
+    if temp < TEMP_DANGER_THRESHOLD:
+        print(f"🚨 [HEALTH] HYPOTHERMIA: Temp = {temp:.1f}°C < {TEMP_DANGER_THRESHOLD}°C")
+    
+    # Kiểm tra nhịp tim
     if bpm > BPM_HIGH_THRESHOLD:
         return STATUS_HIGH_HEART_RATE
     if bpm < BPM_LOW_THRESHOLD:
         return STATUS_LOW_HEART_RATE
+    
     return STATUS_NORMAL
