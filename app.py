@@ -6,7 +6,7 @@ import os
 import json
 import traceback
 import struct
-from threading import Lock
+from threading import Lock, Timer
 
 import numpy as np
 
@@ -38,6 +38,9 @@ def _resolve_api_port() -> int:
 
 
 API_PORT = _resolve_api_port()
+SENSOR_INPUT_PROCESS_DELAY_MS = max(0, int(os.getenv("SENSOR_INPUT_PROCESS_DELAY_MS", "0")))
+WS_HEALTH_EMIT_DELAY_MS = max(0, int(os.getenv("WS_HEALTH_EMIT_DELAY_MS", "120")))
+WS_FALL_EMIT_DELAY_MS = max(0, int(os.getenv("WS_FALL_EMIT_DELAY_MS", "0")))
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -52,6 +55,13 @@ _mqtt_client = None
 _mqtt_client_lock = Lock()
 _current_temperature = 36.5  # Nhiệt độ cơ thể mặc định (lấy từ sensor/data)
 _temp_lock = Lock()
+_emit_timer = None  # Throttle timer cho Socket.IO emit
+_emit_timer_lock = Lock()
+
+# ── Lưu latest vitals từ sensor/data (chỉ 1 value) ────────────────────────────
+_latest_hr = 0.0          # Latest heart rate (BPM) từ sensor/data
+_latest_spo2 = 0.0        # Latest SpO2 (%) từ sensor/data
+_latest_vitals_lock = Lock()
 
 # ── Trạng thái luồng Alert → Fall_Raw ────────────────────────────────────────
 _waiting_for_fall_raw = False      # Chờ dữ liệu fall_raw sau alert
@@ -59,13 +69,47 @@ _pending_alert_data = None         # Lưu alert data để match với fall_raw
 _fall_raw_state_lock = Lock()      # Bảo vệ trạng thái
 
 
+def _emit_with_delay(event: str, data: dict, delay_ms: int = WS_HEALTH_EMIT_DELAY_MS):
+    """Emit Socket.IO event with delay to allow frontend rendering.
+    
+    Throttles rapid updates using a timer. If a new emit is scheduled while
+    one is pending, the old one is cancelled.
+    
+    Args:
+        event: Event name (e.g., 'health_update')
+        data: Event payload dict
+        delay_ms: Delay in milliseconds before emit (default 500ms)
+    """
+    global _emit_timer
+    
+    def do_emit():
+        try:
+            socketio.emit(event, data)
+            print(f"📡 [EMIT] {event} after {delay_ms}ms delay")
+        except Exception as e:
+            print(f"❌ Emit error: {e}")
+    
+    with _emit_timer_lock:
+        if _emit_timer is not None:
+            _emit_timer.cancel()
+
+        if delay_ms <= 0:
+            do_emit()
+            _emit_timer = None
+            return
+
+        _emit_timer = Timer(delay_ms / 1000.0, do_emit)
+        _emit_timer.daemon = True
+        _emit_timer.start()
+
+
 def _get_fall_model():
     global _fall_model
     if _fall_model is None:
         with _fall_model_lock:
             if _fall_model is None:
-                _fall_model = create_fall_model(use_ai=USE_AI_FALL_MODEL)
-                print(f"🤖 Fall model da nap: {'AI(model.h5)' if USE_AI_FALL_MODEL else 'RuleBased'}")
+                _fall_model = create_fall_model()
+                print("🤖 Fall model da nap: AI(model.h5)")
     return _fall_model
 
 
@@ -220,90 +264,52 @@ def _decode_fall_raw_binary(buf: bytes) -> dict | None:
         return None
 
 
-def _pad_samples_to_lstm_window(samples: np.ndarray, target_size: int = 150) -> np.ndarray:
-    """
-    Pad mẫu từ size hiện tại lên target_size (mặc định 150).
-    Nếu samples đã là 150, trả về không thay đổi.
-    Nếu là 75, nhân đôi mỗi mẫu để có 150.
-    
-    Args:
-        samples: shape (num_samples, 8)
-        target_size: kích thước mục tiêu (mặc định 150)
-    
-    Returns:
-        padded array shape (target_size, 8)
-    """
-    current_size = samples.shape[0]
-    
-    if current_size == target_size:
-        return samples
-    
-    # Nếu cần 150 từ 75: nhân đôi mỗi mẫu
-    if current_size * 2 == target_size:
-        return np.repeat(samples, 2, axis=0)
-    
-    # Fallback: linear interpolation
-    indices_old = np.linspace(0, current_size - 1, current_size)
-    indices_new = np.linspace(0, current_size - 1, target_size)
-    padded = np.zeros((target_size, 8), dtype=np.float32)
-    
-    for ch in range(8):
-        padded[:, ch] = np.interp(indices_new, indices_old, samples[:, ch])
-    
-    return padded
-
 
 def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict | None:
-    """
-    Xử lý dữ liệu fall_raw qua model.h5 để detect ngã.
-    
-    Model yêu cầu 11 features: [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
-    Fall_raw binary có 8 channels: [ax, ay, az, gx, gy, gz, magnitude, jerk]
-    
-    Args:
-        decoded_data: dict từ _decode_fall_raw_binary()
-          - data: np.ndarray (num_samples, 8) → [ax, ay, az, gx, gy, gz, mag, jerk]
-          - num_samples: int
-          - pre_samples: int
-          - reason: str
-          - trigger_ts: int
-        alert_data: dict từ alert payload
-    
-    Returns:
-        dict với detected, confidence, num_samples, reason
-        hoặc None nếu lỗi
-    """
+ 
     try:
         model = _get_fall_model()
-        
-        samples_array = decoded_data['data']      # shape (75 hoặc 150, 8)
+        samples_array = decoded_data['data']      # shape (75, 8) từ fall_raw
         num_samples = decoded_data['num_samples']
         reason = decoded_data['reason']
         trigger_ts = decoded_data['trigger_ts']
         pre_samples = decoded_data['pre_samples']
         
-        # Pad nếu cần: 75 → 150
-        if num_samples != model._required_window:
-            print(f"⚠️  Padding: {num_samples} → {model._required_window}")
-            samples_array = _pad_samples_to_lstm_window(samples_array, model._required_window)
+        # ── Use fall_raw payload directly (device sends full 150 samples) ─────────
+        if samples_array.shape[0] < model._required_window:
+            print(
+                f"⏳ fall_raw chua du: {samples_array.shape[0]}/{model._required_window} samples"
+            )
+            return None
+        if samples_array.shape[0] > model._required_window:
+            samples_array = samples_array[:model._required_window]
+
+        motion_buf = samples_array
+        print(
+            f"✅ fall_raw du: {motion_buf.shape[0]}/{model._required_window} samples → Chay model"
+        )
         
-        # ── Build 11-feature vector từ 8-channel raw data ──────────────────────
-        # Model train với: [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
-        # Binary có: [ax, ay, az, gx, gy, gz, magnitude, jerk] → tính roll, pitch
+        # ── Get latest vitals từ sensor/data ──────────────────────────────────────
+        with _latest_vitals_lock:
+            hr = _latest_hr
+            spo2 = _latest_spo2
+        
         temp = _get_current_temperature()
+        print(f"💚 Latest vitals từ sensor/data: HR={hr} BPM, SpO2={spo2:.1f}%, Temp={temp:.1f}°C")
         
-        features_array = np.zeros((samples_array.shape[0], 11), dtype=np.float32)
+        # ── Build 11-feature vector từ motion (150) + latest vitals ──────────────
+        features_array = np.zeros((motion_buf.shape[0], 11), dtype=np.float32)
         
-        for i in range(samples_array.shape[0]):
-            ax, ay, az = samples_array[i, 0], samples_array[i, 1], samples_array[i, 2]
-            gx, gy, gz = samples_array[i, 3], samples_array[i, 4], samples_array[i, 5]
+        for i in range(motion_buf.shape[0]):
+            ax, ay, az = motion_buf[i, 0], motion_buf[i, 1], motion_buf[i, 2]
+            gx, gy, gz = motion_buf[i, 3], motion_buf[i, 4], motion_buf[i, 5]
             
-            # Tính roll, pitch từ acceleration (gyroscope-independent)
+            # Tính roll, pitch từ acceleration
             roll = np.arctan2(ay, az + 1e-6)
             pitch = np.arctan2(-ax, np.sqrt(ay**2 + az**2) + 1e-6)
             
             # 11 features: [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
-            features_array[i] = [ax, ay, az, gx, gy, gz, roll, pitch, 0.0, 0.0, temp]
+            features_array[i] = [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
         
         # Normalize: (X - mean) / (std + eps)
         mean = model._mean
@@ -311,7 +317,7 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict |
         normalized = (features_array - mean) / (std + 1e-6)
         
         # Reshape để inference: (1, num_timesteps, 11)
-        X = normalized[np.newaxis, ...]  # (1, num_samples, 11)
+        X = normalized[np.newaxis, ...]  # (1, 150, 11)
         
         # Inference
         pred = model._model.predict(X, verbose=0)  # output shape: (1, 1)
@@ -321,7 +327,7 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict |
         threshold = float(os.getenv("AI_FALL_THRESHOLD", "0.6"))
         detected = confidence >= threshold
         
-        print(f"🧠 [MODEL] Features=11 | Inference: confidence={confidence:.3f}, threshold={threshold} → detected={detected}")
+        print(f"🧠 [MODEL] Features=11 (150 motion) | Inference: confidence={confidence:.3f}, threshold={threshold} → detected={detected}")
         
         return {
             'detected': detected,
@@ -345,21 +351,55 @@ def _normalize_raw_payload_for_api(raw_payload):
 
     ts = raw_payload.get("ts", raw_payload.get("timestamp"))
     ts_int = int(ts) if ts is not None else int(time.time() * 1000)
+    ts0 = raw_payload.get("ts0")
+    ts0_int = int(ts0) if ts0 is not None else None
 
     temp = _to_non_negative_number(raw_payload.get("temp"))
+    ir_series = _normalize_series_field(raw_payload.get("ir"), "ir", as_int=True)
+    red_series = _normalize_series_field(raw_payload.get("red"), "red", as_int=True)
+    ax_series = _normalize_series_field(raw_payload.get("ax"), "ax")
+    ay_series = _normalize_series_field(raw_payload.get("ay"), "ay")
+    az_series = _normalize_series_field(raw_payload.get("az"), "az")
+    gx_series = _normalize_series_field(raw_payload.get("gx"), "gx")
+    gy_series = _normalize_series_field(raw_payload.get("gy"), "gy")
+    gz_series = _normalize_series_field(raw_payload.get("gz"), "gz")
+
+    explicit_interval = raw_payload.get("sample_interval_ms")
+    inferred_interval = None
+    if explicit_interval is not None:
+        explicit_numeric = _to_non_negative_number(explicit_interval)
+        if explicit_numeric is not None and explicit_numeric >= 1:
+            inferred_interval = int(round(explicit_numeric))
+    elif ts0_int is not None:
+        series_len = max(
+            len(ir_series),
+            len(red_series),
+            len(ax_series),
+            len(ay_series),
+            len(az_series),
+            len(gx_series),
+            len(gy_series),
+            len(gz_series),
+        )
+        if series_len > 1 and ts_int > ts0_int:
+            inferred_interval = max(1, int(round((ts_int - ts0_int) / float(series_len - 1))))
+
     return {
         "ts": ts_int,
-        "ts0": raw_payload.get("ts0"),
+        "timestamp": ts_int,
+        "ts0": ts0_int,
         "temp": round(temp, 2) if temp is not None else None,
-        "sample_interval_ms": raw_payload.get("sample_interval_ms"),
-        "ir": _normalize_series_field(raw_payload.get("ir"), "ir", as_int=True),
-        "red": _normalize_series_field(raw_payload.get("red"), "red", as_int=True),
-        "ax": _normalize_series_field(raw_payload.get("ax"), "ax"),
-        "ay": _normalize_series_field(raw_payload.get("ay"), "ay"),
-        "az": _normalize_series_field(raw_payload.get("az"), "az"),
-        "gx": _normalize_series_field(raw_payload.get("gx"), "gx"),
-        "gy": _normalize_series_field(raw_payload.get("gy"), "gy"),
-        "gz": _normalize_series_field(raw_payload.get("gz"), "gz"),
+        "sample_interval_ms": inferred_interval,
+        "heart_rate": raw_payload.get("heart_rate", raw_payload.get("bpm")),
+        "spo2": raw_payload.get("spo2"),
+        "ir": ir_series,
+        "red": red_series,
+        "ax": ax_series,
+        "ay": ay_series,
+        "az": az_series,
+        "gx": gx_series,
+        "gy": gy_series,
+        "gz": gz_series,
     }
 
 
@@ -472,7 +512,14 @@ def _build_health_update_with_fall(fall_result: dict) -> dict | None:
 
 
 def _to_flutter_packet(health_data, source_topic):
-    """Build health_update packet from health_data."""
+    """Build health_update packet from health_data.
+    
+    NOTE: Fall detection is NOT run on sensor/data (luồng 3) because:
+    - sensor/data only has 50 IR/Red samples (no motion data)
+    - Fall detection requires IMU motion data (ax, ay, az, gx, gy, gz)
+    - Fall detection only runs on sensor/fall_raw (luồng 2) with full 75×8 samples
+    - Therefore fall is always {detected: False, confidence: 0.0} here
+    """
     raw_data = health_data.to_dict()
     data = _normalize_health_data_for_frontend(raw_data)
     
@@ -481,7 +528,7 @@ def _to_flutter_packet(health_data, source_topic):
         "source_topic": source_topic,
         "server_timestamp": int(time.time()),
         "data": data,
-        "fall": {"detected": False, "confidence": 0.0},
+        "fall": {"detected": False, "confidence": 0.0},  # No motion data on sensor/data
     }
 
     if API_VERBOSE_OUTPUT:
@@ -515,7 +562,7 @@ def on_message(client, userdata, msg):
         global _pending_alert_data
 
         # ════════════════════════════════════════════════════════════════════════════════
-        # [LUỒNG 1] SENSOR ALERT - Cảnh báo tức thời từ ESP32
+        # [LUỒNG 2A] SENSOR ALERT - Cảnh báo tức thời (kích hoạt fall detection)
         # ════════════════════════════════════════════════════════════════════════════════
         if msg.topic == "sensor/alert":
             print("🚨 [ALERT] Nhận cảnh báo từ sensor → chờ dữ liệu fall_raw...")
@@ -548,7 +595,7 @@ def on_message(client, userdata, msg):
             return
 
         # ════════════════════════════════════════════════════════════════════════════════
-        # [LUỒNG 2] SENSOR FALL_RAW - Dữ liệu binary từ ESP32 v6 (symmetric window)
+        # [LUỒNG 2B] SENSOR FALL_RAW - Dữ liệu motion sau alert (detect ngã)
         # ════════════════════════════════════════════════════════════════════════════════
         if msg.topic == "sensor/fall_raw":
             with _fall_raw_state_lock:
@@ -567,9 +614,9 @@ def on_message(client, userdata, msg):
                 return
             
             # ────────────────────────────────────────────────────────────────────────────
-            # [KỲ 1] Xử lý dữ liệu qua model.h5 (AI LSTM Inference)
+            # Motion data (150 mẫu) → Build 11-feature matrix → Model inference
             # ────────────────────────────────────────────────────────────────────────────
-            print(f"🧠 [AI INFERENCE] Đang xử lý {decoded['num_samples']} samples qua model.h5...")
+            print(f"🧠 [MODEL] Đang xử lý {decoded['num_samples']} motion samples...")
             result = _process_fall_raw_with_model(decoded, pending_alert)
             
             if result:
@@ -579,14 +626,15 @@ def on_message(client, userdata, msg):
                     print(f"✓ [RESULT] Không phải ngã | Confidence: {result['confidence']:.3f}")
                 
                 # ────────────────────────────────────────────────────────────────────────
-                # [KỲ 2] Kết hợp fall detection + health vitals → health_update (CHỈ 1 RESPONSE)
+                # Kết hợp fall detection result với health vitals cuối cùng
+                # → Emit SINGLE "health_update" event (không tách thành 2 responses)
                 # ────────────────────────────────────────────────────────────────────────
                 health_with_fall = _build_health_update_with_fall(result)
                 
                 if health_with_fall:
                     # 💓 Gửi MỘT response duy nhất: health_update (kết hợp fall + vitals)
                     _append_history(health_with_fall)
-                    socketio.emit("health_update", health_with_fall)
+                    _emit_with_delay("health_update", health_with_fall, delay_ms=WS_FALL_EMIT_DELAY_MS)
                     
                     fall_status = "TE_NGA" if result['detected'] else "NO_FALL"
                     print(f"💓 [RESPONSE] {fall_status} | BPM={health_with_fall['data'].get('bpm')} "
@@ -601,8 +649,13 @@ def on_message(client, userdata, msg):
             return
 
         # ════════════════════════════════════════════════════════════════════════════════
-        # [LUỒNG 3] SENSOR DATA - Dữ liệu SpO2/BPM thường xuyên (JSON)
+        # [LUỒNG 1] SENSOR DATA - Đọc dữ liệu sức khỏe (SpO2/BPM) thường xuyên từ ESP32
         # ════════════════════════════════════════════════════════════════════════════════
+        
+        # Optional input delay for noisy deployments; default is 0 for low latency.
+        if SENSOR_INPUT_PROCESS_DELAY_MS > 0:
+            time.sleep(SENSOR_INPUT_PROCESS_DELAY_MS / 1000.0)
+        
         raw = msg.payload.decode()
         try:
             raw_payload = json.loads(raw)
@@ -614,7 +667,7 @@ def on_message(client, userdata, msg):
         # Cập nhật temperature hiện tại từ sensor/data
         _update_temperature(raw_payload.get("temp"))
         
-        health_samples = from_json_samples(raw)
+        health_samples = from_json_samples(json.dumps(normalized_raw_payload))
 
         latest_packet = None
         for health_data in health_samples:
@@ -632,15 +685,23 @@ def on_message(client, userdata, msg):
                 _latest_packet = latest_packet
                 _latest_raw_payload = normalized_raw_payload
 
-            # Save and push only the final packet for each MQTT message.
-            _append_history(latest_packet)
-            socketio.emit("health_update", latest_packet)
+            with _fall_raw_state_lock:
+                waiting_for_fall_raw = _waiting_for_fall_raw
 
-            print(
-                f"💓 [LUỒNG 3 - SENSOR] Da xu ly {len(health_samples)} mau tu {msg.topic} | "
-                f"BPM={latest_packet['data']['bpm']} SpO2={latest_packet['data']['spo2']}% "
-                f"Temp={latest_packet['data']['temp']}°C"
-            )
+            if waiting_for_fall_raw:
+                print(
+                    "⏳ [LUỒNG 1 - SENSOR DATA] Dang cho fall_raw, tam ngung emit health_update"
+                )
+            else:
+                # Save and push only the final packet for each MQTT message.
+                _append_history(latest_packet)
+                _emit_with_delay("health_update", latest_packet, delay_ms=WS_HEALTH_EMIT_DELAY_MS)
+
+                print(
+                    f"💓 [LUỒNG 1 - SENSOR DATA] Đã xử lý {len(health_samples)} mẫu từ {msg.topic} | "
+                    f"BPM={latest_packet['data']['bpm']} SpO2={latest_packet['data']['spo2']}% "
+                    f"Temp={latest_packet['data']['temp']}°C"
+                )
             
     except ValueError as exc:
         print("❌ Payload khong hop le:", exc)
@@ -710,6 +771,83 @@ def get_latest_health():
         if _latest_packet is None:
             return jsonify({"message": "Chua nhan duoc du lieu suc khoe"}), 404
         return jsonify(_latest_packet)
+
+
+@app.get("/api/docs")
+def get_api_docs():
+    return jsonify(
+        {
+            "name": "Heart Rate Monitor Backend API",
+            "version": "1.0",
+            "base_url_hint": "/api",
+            "http_endpoints": [
+                {
+                    "method": "GET",
+                    "path": "/api/docs",
+                    "description": "Tai lieu API cho frontend.",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/health/latest",
+                    "description": "Lay goi du lieu suc khoe moi nhat.",
+                    "query": {
+                        "format": {
+                            "type": "string",
+                            "allowed": ["packet", "raw"],
+                            "default": "packet",
+                        }
+                    },
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/health/history",
+                    "description": "Lay lich su health_update moi nhat.",
+                    "query": {
+                        "limit": {
+                            "type": "integer",
+                            "min": 1,
+                            "max": 1000,
+                            "default": 50,
+                        }
+                    },
+                },
+            ],
+            "websocket": {
+                "transport": "Socket.IO",
+                "events": [
+                    {
+                        "event": "health_update",
+                        "description": "Ban tin tong hop suc khoe (BPM/SpO2/Temp/Status) va co the kem ket qua te nga.",
+                        "payload_shape": {
+                            "type": "health_update",
+                            "source_topic": "sensor/data",
+                            "timestamp": "unix_seconds",
+                            "data": {
+                                "bpm": "number",
+                                "spo2": "number_or_null",
+                                "temp": "number",
+                                "status": "NORMAL|FEVER|HIGH_HEART_RATE|LOW_HEART_RATE|FALL_DETECTED",
+                                "fall": {"detected": "bool", "confidence": "number"},
+                            },
+                        },
+                    },
+                    {
+                        "event": "sensor_alert",
+                        "description": "Canh bao checking tu luong phat hien nga truoc khi co ket qua AI.",
+                    },
+                    {
+                        "event": "health_error",
+                        "description": "Loi parse/validate payload MQTT.",
+                    },
+                ],
+            },
+            "notes": [
+                "Frontend nen uu tien nghe health_update theo thoi gian thuc.",
+                "Neu can debug raw payload tu ESP32, goi /api/health/latest?format=raw.",
+                "Gia tri BPM co the la 0 khi tin hieu IR khong du chat luong de detect peak.",
+            ],
+        }
+    )
 
 
 @app.get("/api/health/history")

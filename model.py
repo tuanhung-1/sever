@@ -136,6 +136,73 @@ def _is_valid_vital(value: Any) -> bool:
         return False
 
 
+def _sample_rate_hz(sample_interval_ms: int) -> float:
+    return 1000.0 / float(max(1, sample_interval_ms))
+
+
+def _infer_sample_interval_ms(
+    normalized: Dict[str, Any],
+    sample_count: int,
+    fallback_ms: int,
+) -> int:
+    explicit_interval = normalized.get("sample_interval_ms")
+    if explicit_interval is not None:
+        return max(1, _to_int(explicit_interval, "sample_interval_ms"))
+
+    if sample_count > 1 and normalized.get("ts0") is not None:
+        try:
+            end_ts = _to_int(
+                normalized.get("timestamp", normalized.get("ts", int(time.time() * 1000))),
+                "timestamp",
+            )
+            start_ts = _to_int(normalized["ts0"], "ts0")
+            duration_ms = max(1, end_ts - start_ts)
+            inferred = int(round(duration_ms / float(sample_count - 1)))
+            if inferred > 0:
+                return inferred
+        except ValueError:
+            pass
+
+    return max(1, int(fallback_ms))
+
+
+def _sanitize_optical_series(values: List[int]) -> List[int]:
+    if not values:
+        return values
+
+    sanitized = list(values)
+    first_valid = next((v for v in sanitized if v > 0), None)
+    if first_valid is None:
+        return sanitized
+
+    last_valid = first_valid
+    for idx, value in enumerate(sanitized):
+        if value > 0:
+            last_valid = value
+        else:
+            sanitized[idx] = last_valid
+
+    return sanitized
+
+
+def _remove_dc(signal: np.ndarray, window_size: int) -> np.ndarray:
+    if window_size < 2 or signal.size == 0:
+        return signal - float(np.mean(signal))
+    kernel = np.ones(window_size, dtype=np.float64) / float(window_size)
+    baseline = np.convolve(signal, kernel, mode="same")
+    return signal - baseline
+
+
+def _bandpass_fft(signal: np.ndarray, sample_rate_hz: float, low_hz: float, high_hz: float) -> np.ndarray:
+    if signal.size == 0:
+        return signal
+    freqs = np.fft.rfftfreq(signal.size, d=1.0 / sample_rate_hz)
+    spectrum = np.fft.rfft(signal)
+    mask = (freqs >= low_hz) & (freqs <= high_hz)
+    spectrum[~mask] = 0
+    return np.fft.irfft(spectrum, n=signal.size)
+
+
 def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> float | None:
     if len(ir_values) < 20:
         return None
@@ -148,19 +215,24 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
         print(f"⚠️  IR signal co std = {signal_std:.2f} (qua thap, ko phat hien duoc nhip tim)")
         return None
 
-    # Light smoothing to suppress sensor noise.
-    kernel = np.ones(5, dtype=np.float64) / 5.0
-    smooth = np.convolve(signal, kernel, mode="same")
-    centered = smooth - np.mean(smooth)
+    sample_rate_hz = _sample_rate_hz(sample_interval_ms)
+    dc_window = max(2, int(sample_rate_hz * 1.0))
+    centered = _remove_dc(signal, dc_window)
+    filtered = _bandpass_fft(centered, sample_rate_hz, 0.5, 4.0)
 
-    threshold = max(1.0, 0.45 * np.std(centered))
-    sample_rate_hz = 1000.0 / float(max(1, sample_interval_ms))
-    min_gap = max(1, int(sample_rate_hz * 0.30))
+    filtered_std = float(np.std(filtered))
+    if filtered_std <= 1e-6:
+        print("⚠️  IR filtered std qua thap, bo qua BPM")
+        return None
+
+    normalized = filtered / filtered_std
+    threshold = max(0.4, 0.5 * float(np.std(normalized)))
+    min_gap = max(1, int(sample_rate_hz * 0.40))
 
     peaks: List[int] = []
-    for idx in range(1, len(centered) - 1):
-        is_peak = centered[idx] > centered[idx - 1] and centered[idx] >= centered[idx + 1]
-        if not is_peak or centered[idx] <= threshold:
+    for idx in range(1, len(normalized) - 1):
+        is_peak = normalized[idx] > normalized[idx - 1] and normalized[idx] >= normalized[idx + 1]
+        if not is_peak or normalized[idx] <= threshold:
             continue
 
         if not peaks or idx - peaks[-1] >= min_gap:
@@ -184,7 +256,11 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
     return float(np.clip(bpm, MIN_BPM, MAX_BPM))
 
 
-def _estimate_spo2_from_ir_red(ir_values: List[int], red_values: List[int]) -> float | None:
+def _estimate_spo2_from_ir_red(
+    ir_values: List[int],
+    red_values: List[int],
+    sample_interval_ms: int,
+) -> float | None:
     """
     Estimate SpO2 using AC/DC method.
     
@@ -199,14 +275,20 @@ def _estimate_spo2_from_ir_red(ir_values: List[int], red_values: List[int]) -> f
     ir = np.array(ir_values, dtype=np.float64)
     red = np.array(red_values, dtype=np.float64)
 
-    # DC: giá trị trung bình
+    sample_rate_hz = _sample_rate_hz(sample_interval_ms)
+    dc_window = max(2, int(sample_rate_hz * 1.0))
+
     ir_dc = float(np.mean(ir))
     red_dc = float(np.mean(red))
-    
-    # AC: RMS (root mean square) của dao động
-    # AC = RMS(signal - DC) = sqrt(mean((signal-DC)²))
-    ir_ac = float(np.sqrt(np.mean((ir - ir_dc) ** 2)))  # RMS, không phải std
-    red_ac = float(np.sqrt(np.mean((red - red_dc) ** 2)))  # RMS, không phải std
+
+    ir_centered = _remove_dc(ir, dc_window)
+    red_centered = _remove_dc(red, dc_window)
+
+    ir_filt = _bandpass_fft(ir_centered, sample_rate_hz, 0.5, 4.0)
+    red_filt = _bandpass_fft(red_centered, sample_rate_hz, 0.5, 4.0)
+
+    ir_ac = float(np.std(ir_filt))
+    red_ac = float(np.std(red_filt))
 
     if ir_dc <= 1e-6 or red_dc <= 1e-6 or ir_ac <= 1e-6:
         return None
@@ -337,11 +419,11 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     if normalized.get("red") is not None:
         red_series = _to_optional_int_list(normalized.get("red"), "red", sample_count)
 
-    sample_interval_ms = _to_int(
-        normalized.get("sample_interval_ms", DEFAULT_BATCH_SAMPLE_INTERVAL_MS),
-        "sample_interval_ms",
+    sample_interval_ms = _infer_sample_interval_ms(
+        normalized,
+        sample_count=sample_count,
+        fallback_ms=DEFAULT_BATCH_SAMPLE_INTERVAL_MS,
     )
-    sample_interval_ms = max(1, sample_interval_ms)
 
     batch_end_timestamp = _to_int(
         normalized.get("timestamp", normalized.get("ts", int(time.time() * 1000))),
@@ -354,11 +436,14 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
 
     temp_value = _to_float(normalized.get("temp", 0.0), "temp")
 
+    clean_ir_series = _sanitize_optical_series(ir_series) if ir_series is not None else None
+    clean_red_series = _sanitize_optical_series(red_series) if red_series is not None else None
+
     heart_rate: float | None = None
     if _is_valid_vital(normalized.get("heart_rate")):
         heart_rate = _to_float(normalized["heart_rate"], "heart_rate")
-    elif ir_series is not None:
-        heart_rate = _estimate_bpm_from_ir(ir_series, sample_interval_ms)
+    elif clean_ir_series is not None:
+        heart_rate = _estimate_bpm_from_ir(clean_ir_series, sample_interval_ms)
 
     if heart_rate is None:
         heart_rate = 0.0
@@ -366,8 +451,8 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     spo2_value: float | None = None
     if _is_valid_vital(normalized.get("spo2")):
         spo2_value = _to_float(normalized["spo2"], "spo2")
-    elif ir_series is not None and red_series is not None:
-        spo2_value = _estimate_spo2_from_ir_red(ir_series, red_series)
+    elif clean_ir_series is not None and clean_red_series is not None:
+        spo2_value = _estimate_spo2_from_ir_red(clean_ir_series, clean_red_series, sample_interval_ms)
 
     samples: List[HealthData] = []
     for idx in range(sample_count):
@@ -383,8 +468,8 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
                 heart_rate=heart_rate,
                 spo2=spo2_value,
                 temp=temp_value,
-                ir=ir_series[idx] if ir_series is not None else None,
-                red=red_series[idx] if red_series is not None else None,
+                ir=clean_ir_series[idx] if clean_ir_series is not None else None,
+                red=clean_red_series[idx] if clean_red_series is not None else None,
                 timestamp=sample_timestamp,
             )
         )

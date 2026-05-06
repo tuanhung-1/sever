@@ -61,33 +61,6 @@ class BaseFallModel:
         raise NotImplementedError("Can cai dat predict() trong model te nga cu the")
 
 
-class RuleBasedFallModel(BaseFallModel):
-    """
-    Temporary model for testing pipeline.
-
-    Replace this class with a real ML model later.
-    Current logic uses simple thresholds from acceleration/gyro magnitude.
-    """
-
-    def __init__(self, accel_threshold: float = 2.6, gyro_threshold: float = 4.5) -> None:
-        self.accel_threshold = accel_threshold
-        self.gyro_threshold = gyro_threshold
-
-    def predict(self, data: FallInput) -> FallPrediction:
-        accel_mag = (data.ax ** 2 + data.ay ** 2 + data.az ** 2) ** 0.5
-        gyro_mag = (data.gx ** 2 + data.gy ** 2 + data.gz ** 2) ** 0.5
-
-        is_fall = accel_mag >= self.accel_threshold and gyro_mag >= self.gyro_threshold
-
-        # Simple confidence proxy for test mode only.
-        confidence = min(1.0, max(accel_mag / (self.accel_threshold * 1.5), gyro_mag / (self.gyro_threshold * 1.5)))
-
-        return FallPrediction(
-            fall_detected=is_fall,
-            confidence=confidence,
-        )
-
-
 class PlaceholderAIFallModel(BaseFallModel):
     """
     Placeholder for your real AI model.
@@ -178,23 +151,15 @@ class PlaceholderAIFallModel(BaseFallModel):
         )
 
 
-def create_fall_model(use_ai: bool = True) -> BaseFallModel:
+def create_fall_model() -> BaseFallModel:
     """
     Factory for selecting model implementation.
 
-    - use_ai=True (default): use the trained AI model (LSTM+CNN) from model.h5
-    - use_ai=False: fallback to RuleBasedFallModel for testing
+    Always use the trained AI model (LSTM+CNN) from model.h5.
     """
-    if use_ai:
-        try:
-            model = PlaceholderAIFallModel(model_path=AI_MODEL_PATH)
-            print(f"✅ Loaded AI Fall Model from {AI_MODEL_PATH}")
-            return model
-        except Exception as e:
-            print(f"⚠️  Could not load AI model ({e}). Falling back to RuleBasedFallModel")
-            return RuleBasedFallModel()
-    
-    return RuleBasedFallModel()
+    model = PlaceholderAIFallModel(model_path=AI_MODEL_PATH)
+    print(f"✅ Loaded AI Fall Model from {AI_MODEL_PATH}")
+    return model
 
 
 def build_fall_input_from_payload(payload: dict) -> FallInput:
