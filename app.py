@@ -7,6 +7,7 @@ import json
 import traceback
 import struct
 from threading import Lock, Timer
+from collections import deque
 
 import numpy as np
 
@@ -16,14 +17,61 @@ from flask_socketio import SocketIO
 from fall_model import create_fall_model
 from model import from_json_samples, classify, STATUS_FALL_DETECTED
 
+_buzzer_active = False
+_wait_next_normal_batch = False
+# Lưu lịch sử nhiều batch
+# Buffer lưu 5 batch gần nhất
+_vital_batch_buffer = deque(maxlen=4)
+
+# Cooldown tránh spam
+_last_alert_time = 0
+ALERT_COOLDOWN_S = 20
+
+_batch_alert_lock = Lock()
+
+
+
+VITAL_THRESHOLDS = {
+    "bpm": {
+        "low":  int(os.getenv("ALERT_BPM_LOW",  "50")),   # < 50 → bradycardia
+        "high": int(os.getenv("ALERT_BPM_HIGH", "120")),  # > 120 → tachycardia
+    },
+    "spo2": {
+        "low":  float(os.getenv("ALERT_SPO2_LOW",  "90.0")),  # < 90 → nguy hiểm
+        "high": float(os.getenv("ALERT_SPO2_HIGH", "100.1")), # SpO2 không có high thực tế
+    },
+    "temp": {
+        "low":  float(os.getenv("ALERT_TEMP_LOW",  "35.0")),  # < 35 → hạ thân nhiệt
+        "high": float(os.getenv("ALERT_TEMP_HIGH", "37.5")),  # > 37.5 → sốt
+    },
+}
+ 
+# Tần số beep: ON ms, OFF ms, số lần lặp trong 60 giây
+ALERT_BEEP_ON_MS    = max(100, int(os.getenv("ALERT_BEEP_ON_MS",   "500")))
+ALERT_BEEP_OFF_MS   = max(100, int(os.getenv("ALERT_BEEP_OFF_MS",  "700")))
+ALERT_BEEP_DURATION_S = max(10, int(os.getenv("ALERT_BEEP_DURATION_S", "60")))
+ 
+# State machine: theo dõi trạng thái trước của từng vital
+# Giá trị: True = đang abnormal, False = đang normal
+_vital_prev_abnormal: dict[str, bool] = {
+    "bpm":  False,
+    "spo2": False,
+    "temp": False,
+}
+_alert_state_lock = Lock()
+ 
+# Danh sách timer đang chạy (để cancel khi có alert mới)
+_alert_timers: list[Timer] = []
+_alert_timers_lock = Lock()
+
 BROKER = "11060dbd13b54fc988ae8f9bfc43c089.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 USERNAME = "heart-rate"
 PASSWORD = "aB123456"
-CLIENT_ID = "python_backend"
+CLIENT_ID = "python_backend1"
 MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
-API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "127.0.0.1")
+API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "192.168.1.23")
 HISTORY_FILE = os.getenv("HISTORY_FILE", "health_history.jsonl")
 USE_AI_FALL_MODEL = os.getenv("USE_AI_FALL_MODEL", "true").lower() == "true"
 API_VERBOSE_OUTPUT = os.getenv("API_VERBOSE_OUTPUT", "false").lower() == "true"
@@ -41,6 +89,11 @@ API_PORT = _resolve_api_port()
 SENSOR_INPUT_PROCESS_DELAY_MS = max(0, int(os.getenv("SENSOR_INPUT_PROCESS_DELAY_MS", "0")))
 WS_HEALTH_EMIT_DELAY_MS = max(0, int(os.getenv("WS_HEALTH_EMIT_DELAY_MS", "120")))
 WS_FALL_EMIT_DELAY_MS = max(0, int(os.getenv("WS_FALL_EMIT_DELAY_MS", "0")))
+FALL_MODEL_BLOCK_MS = max(0, int(os.getenv("FALL_MODEL_BLOCK_MS", "5000")))
+BUZZER_BEEP_ON_MS = max(0, int(os.getenv("BUZZER_BEEP_ON_MS", "2000")))
+BUZZER_BEEP_OFF_MS = max(0, int(os.getenv("BUZZER_BEEP_OFF_MS", "1000")))
+BUZZER_BEEP_COUNT = max(1, int(os.getenv("BUZZER_BEEP_COUNT", "2")))
+BUZZER_TOTAL_MS = max(0, int(os.getenv("BUZZER_TOTAL_MS", "60000")))
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -53,19 +106,42 @@ _fall_model_lock = Lock()
 _fall_model = None
 _mqtt_client = None
 _mqtt_client_lock = Lock()
+_mqtt_connected = False
 _current_temperature = 36.5  # Nhiệt độ cơ thể mặc định (lấy từ sensor/data)
 _temp_lock = Lock()
 _emit_timer = None  # Throttle timer cho Socket.IO emit
 _emit_timer_lock = Lock()
+
+
 
 # ── Lưu latest vitals từ sensor/data (chỉ 1 value) ────────────────────────────
 _latest_hr = 0.0          # Latest heart rate (BPM) từ sensor/data
 _latest_spo2 = 0.0        # Latest SpO2 (%) từ sensor/data
 _latest_vitals_lock = Lock()
 
-# ── Trạng thái luồng Alert → Fall_Raw ────────────────────────────────────────
-_waiting_for_fall_raw = False      # Chờ dữ liệu fall_raw sau alert
-_pending_alert_data = None         # Lưu alert data để match với fall_raw
+# Last valid vitals preserved across packets (only updated when new values are valid)
+_last_valid_vitals = {"heart_rate": None, "spo2": None, "temp": None}
+
+
+def _is_valid_vital_value(key: str, value):
+    try:
+        if value is None:
+            return False
+        if key == "heart_rate":
+            v = float(value)
+            return v > 0 and v < 300
+        if key == "spo2":
+            v = float(value)
+            return 50.0 <= v <= 200.0
+        if key == "temp":
+            v = float(value)
+            return 25.0 <= v <= 45.0
+    except Exception:
+        return False
+    return False
+
+# ── Trạng thái luồng Fall_Raw (pause health emits while processing) ────────
+_waiting_for_fall_raw = False
 _fall_raw_state_lock = Lock()      # Bảo vệ trạng thái
 
 
@@ -123,7 +199,126 @@ def _append_history(packet):
         with open(HISTORY_FILE, "a", encoding="utf-8") as file:
             file.write(json.dumps(history_line, ensure_ascii=False) + "\n")
 
+def _handle_alert_over_5_batches(health_samples):
 
+    """
+    Logic alert:
+    - Giữ 4 batch gần nhất
+    - Trigger nếu:
+        + >=3/4 batch abnormal
+        + batch cuối phải abnormal
+    - Nếu batch cuối normal -> tắt buzzer
+    """
+
+    global _last_alert_time
+    global _buzzer_active
+    global _wait_next_normal_batch  
+    if not health_samples:
+        return
+
+    last_bpm = None
+    last_spo2 = None
+    last_temp = None
+
+    # lấy sample cuối batch
+    for sample in health_samples:
+
+        if _is_valid_vital_value(
+            "heart_rate",
+            getattr(sample, "heart_rate", None)
+        ):
+            last_bpm = float(sample.heart_rate)
+
+        if _is_valid_vital_value(
+            "spo2",
+            getattr(sample, "spo2", None)
+        ):
+            last_spo2 = float(sample.spo2)
+
+        if _is_valid_vital_value(
+            "temp",
+            getattr(sample, "temp", None)
+        ):
+            last_temp = float(sample.temp)
+
+    batch_state = {
+        "bpm": _is_vital_abnormal("bpm", last_bpm),
+        "spo2": _is_vital_abnormal("spo2", last_spo2),
+        "temp": _is_vital_abnormal("temp", last_temp),
+    }
+
+    with _batch_alert_lock:
+
+        _vital_batch_buffer.append(batch_state)
+
+        # chưa đủ 4 batch
+        if len(_vital_batch_buffer) < 4:
+            return
+
+        latest = _vital_batch_buffer[-1]
+
+        bpm_count = sum(1 for b in _vital_batch_buffer if b["bpm"])
+        spo2_count = sum(1 for b in _vital_batch_buffer if b["spo2"])
+        temp_count = sum(1 for b in _vital_batch_buffer if b["temp"])
+
+    triggered = []
+
+    # ===== BPM =====
+    if latest["bpm"] and bpm_count >= 2:
+        triggered.append("bpm")
+
+    # ===== SpO2 =====
+    if latest["spo2"] and spo2_count >= 2:
+        triggered.append("spo2")
+
+    # ===== TEMP =====
+    if latest["temp"] and temp_count >= 2:
+        triggered.append("temp")
+
+    # =====================================================
+    # Nếu batch cuối normal hết -> tắt buzzer
+    # =====================================================
+
+    
+    if not triggered:
+
+    # Nếu trước đó đã alert
+    # thì batch bình thường kế tiếp mới tắt
+        if _wait_next_normal_batch and _buzzer_active:
+
+            print("✅ Batch kế tiếp đã bình thường -> tắt còi")
+
+            _stop_buzzer()
+
+            _wait_next_normal_batch = False
+
+        return
+
+    # =====================================================
+    # Nếu đang kêu rồi -> không fire lại
+    # =====================================================
+
+    if _buzzer_active:
+        return
+
+    now = time.time()
+
+    # cooldown chống spam
+    if now - _last_alert_time < ALERT_COOLDOWN_S:
+        return
+
+    _last_alert_time = now
+
+    print(
+        f"🚨 ALERT 4-BATCH | "
+        f"BPM={bpm_count}/4 "
+        f"SpO2={spo2_count}/4 "
+        f"Temp={temp_count}/4"
+    )
+
+    _buzzer_active = True
+
+    _fire_beep_pattern()
 def _read_history(limit=50):
     """Doc lich su do duoc tu file, uu tien ban ghi moi nhat."""
     if limit <= 0:
@@ -349,6 +544,97 @@ def _normalize_raw_payload_for_api(raw_payload):
     if not isinstance(raw_payload, dict):
         raise ValueError("Payload khong hop le, can doi tuong JSON")
 
+    # Support new payload format: {"fs": <hz>, "temp": <degC>, "data": [{"t":..., "ir":..., "red":...}, ...]}
+    if isinstance(raw_payload.get("data"), list) and raw_payload.get("data"):
+        series = raw_payload.get("data")
+        # extract timestamps and series values
+        times = []
+        ir_vals = []
+        red_vals = []
+        for item in series:
+            if not isinstance(item, dict):
+                continue
+            # accept keys: t, ts, timestamp
+            t = item.get("t") if "t" in item else item.get("ts", item.get("timestamp"))
+            if t is not None:
+                try:
+                    times.append(int(t))
+                except Exception:
+                    times.append(None)
+            else:
+                times.append(None)
+
+            ir_vals.append(int(item.get("ir")) if item.get("ir") is not None else 0)
+            red_vals.append(int(item.get("red")) if item.get("red") is not None else 0)
+
+        # Determine ts0 and ts from times if available
+        ts0_int = None
+        ts_int = None
+        valid_times = [t for t in times if isinstance(t, int)]
+        if valid_times:
+            ts0_int = valid_times[0]
+            ts_int = valid_times[-1]
+
+        # sample interval from fs (frequency Hz) if provided
+        fs = raw_payload.get("fs")
+        sample_interval_ms = None
+        try:
+            if fs is not None:
+                f = float(fs)
+                if f > 0:
+                    fs_interval_ms = max(1, int(round(1000.0 / f)))
+                else:
+                    fs_interval_ms = None
+            else:
+                fs_interval_ms = None
+        except Exception:
+            fs_interval_ms = None
+
+        # If data timestamps exist, infer interval from median diff of timestamps
+        sample_interval_ms_time = None
+        try:
+            if len(valid_times) > 1:
+                import numpy as _np
+
+                diffs = _np.diff(_np.array(valid_times, dtype=np.int64))
+                # ignore non-positive diffs
+                diffs = diffs[diffs > 0]
+                if diffs.size > 0:
+                    sample_interval_ms_time = int(max(1, int(_np.median(diffs))))
+        except Exception:
+            sample_interval_ms_time = None
+
+        # Prefer timestamp-derived interval when available (more reliable), but warn if differs from fs
+        if sample_interval_ms_time is not None:
+            sample_interval_ms = sample_interval_ms_time
+            if fs_interval_ms is not None and fs_interval_ms > 0:
+                # if difference >20% warn
+                diff_frac = abs(sample_interval_ms_time - fs_interval_ms) / float(fs_interval_ms)
+                if diff_frac > 0.2:
+                    print(f"⚠️  fs ({fs_interval_ms}ms) and timestamps-derived interval ({sample_interval_ms_time}ms) differ by {diff_frac*100:.0f}% - using timestamps")
+        else:
+            sample_interval_ms = fs_interval_ms
+
+        # Build a normalized payload compatible with existing logic
+        return {
+            "ts": ts_int if ts_int is not None else int(time.time() * 1000),
+            "timestamp": ts_int if ts_int is not None else int(time.time() * 1000),
+            "ts0": ts0_int,
+            "temp": _to_non_negative_number(raw_payload.get("temp")),
+            "sample_interval_ms": sample_interval_ms,
+            "heart_rate": raw_payload.get("heart_rate", raw_payload.get("bpm")),
+            "spo2": raw_payload.get("spo2"),
+            "ir": ir_vals,
+            "red": red_vals,
+            # Motion fields missing in this payload shape -> set to None to avoid batch-list errors
+            "ax": None,
+            "ay": None,
+            "az": None,
+            "gx": None,
+            "gy": None,
+            "gz": None,
+        }
+
     ts = raw_payload.get("ts", raw_payload.get("timestamp"))
     ts_int = int(ts) if ts is not None else int(time.time() * 1000)
     ts0 = raw_payload.get("ts0")
@@ -394,12 +680,13 @@ def _normalize_raw_payload_for_api(raw_payload):
         "spo2": raw_payload.get("spo2"),
         "ir": ir_series,
         "red": red_series,
-        "ax": ax_series,
-        "ay": ay_series,
-        "az": az_series,
-        "gx": gx_series,
-        "gy": gy_series,
-        "gz": gz_series,
+        # Convert empty-series -> None, single-value lists -> scalar, keep lists for true batch
+        "ax": (None if not ax_series else (ax_series[0] if len(ax_series) == 1 else ax_series)),
+        "ay": (None if not ay_series else (ay_series[0] if len(ay_series) == 1 else ay_series)),
+        "az": (None if not az_series else (az_series[0] if len(az_series) == 1 else az_series)),
+        "gx": (None if not gx_series else (gx_series[0] if len(gx_series) == 1 else gx_series)),
+        "gy": (None if not gy_series else (gy_series[0] if len(gy_series) == 1 else gy_series)),
+        "gz": (None if not gz_series else (gz_series[0] if len(gz_series) == 1 else gz_series)),
     }
 
 
@@ -539,16 +826,30 @@ def _to_flutter_packet(health_data, source_topic):
 
 # ====== CALLBACK ======
 def on_connect(client, userdata, flags, reason_code, properties=None):
+    global _mqtt_connected
+    # reason_code == 0 => connection successful
     if reason_code == 0:
-        print("✅ Da ket noi HiveMQ Cloud")
+        # Only print the connected message on transition from disconnected -> connected
+        if not _mqtt_connected:
+            print("✅ Da ket noi HiveMQ Cloud")
+        _mqtt_connected = True
 
-        client.subscribe("sensor/#")
+        # Ensure subscriptions are (re)registered on every connect
+        client.subscribe("sensor/data")
+        client.subscribe("sensor/fall_raw")
         client.subscribe("health/#")
 
-        print("📡 Da dang ky topic: sensor/#, health/#")
-
+        if not _mqtt_connected:
+            print("📡 Da dang ky topic: sensor/#, health/#")
     else:
         print("❌ Ket noi that bai, ma loi:", reason_code)
+
+
+def on_disconnect(client, userdata, rc, properties=None):
+    """MQTT disconnect handler: mark disconnected and log reason."""
+    global _mqtt_connected
+    _mqtt_connected = False
+    print(f"⚠️ MQTT disconnected, rc={rc}")
 
 
 def on_message(client, userdata, msg):
@@ -559,93 +860,75 @@ def on_message(client, userdata, msg):
         global _latest_packet
         global _latest_raw_payload
         global _waiting_for_fall_raw
-        global _pending_alert_data
+        global _latest_hr
+        global _latest_spo2
+        global _last_alert_status
 
-        # ════════════════════════════════════════════════════════════════════════════════
-        # [LUỒNG 2A] SENSOR ALERT - Cảnh báo tức thời (kích hoạt fall detection)
-        # ════════════════════════════════════════════════════════════════════════════════
-        if msg.topic == "sensor/alert":
-            print("🚨 [ALERT] Nhận cảnh báo từ sensor → chờ dữ liệu fall_raw...")
-            try:
-                raw = msg.payload.decode()
-                alert_payload = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                print(f"⚠️  Alert payload không phải JSON: {e}")
-                return
-            
-            with _fall_raw_state_lock:
-                _waiting_for_fall_raw = True
-                _pending_alert_data = alert_payload
-            
-            alert_packet = {
-                "type": "fall_alert",
-                "source_topic": msg.topic,
-                "server_timestamp": int(time.time()),
-                "data": {
-                    "ts": alert_payload.get("ts", alert_payload.get("trigger")),
-                    "trigger": alert_payload.get("trigger", "unknown"),
-                    "peak_g": alert_payload.get("peak_g"),
-                    "delta_g": alert_payload.get("delta_g"),
-                },
-            }
-            
-            _append_history(alert_packet)
-            socketio.emit("sensor_alert", alert_packet)
-            print(f"🚨 [ALERT] Ghi lại cảnh báo | trigger={alert_payload.get('trigger')} | chờ tối đa 10 giây")
-            return
+        # NOTE: `sensor/alert` handling removed — fall processing triggers on `sensor/fall_raw` only.
 
         # ════════════════════════════════════════════════════════════════════════════════
         # [LUỒNG 2B] SENSOR FALL_RAW - Dữ liệu motion sau alert (detect ngã)
         # ════════════════════════════════════════════════════════════════════════════════
         if msg.topic == "sensor/fall_raw":
             with _fall_raw_state_lock:
-                if not _waiting_for_fall_raw:
-                    print("⚠️  Nhận fall_raw nhưng không có alert trước đó → bỏ qua")
+                # When fall_raw arrives we pause health emits and run the fall model.
+                # We no longer require a prior alert to trigger processing.
+                _waiting_for_fall_raw = True
+                pending_alert = None
+
+            try:
+                # Decode binary payload (75 hoặc 150 samples × 8 channels)
+                decoded = _decode_fall_raw_binary(msg.payload)
+                if not decoded:
+                    print("❌ Không thể decode fall_raw binary")
                     return
-                
-                _waiting_for_fall_raw = False
-                pending_alert = _pending_alert_data
-                _pending_alert_data = None
-            
-            # Decode binary payload (75 hoặc 150 samples × 8 channels)
-            decoded = _decode_fall_raw_binary(msg.payload)
-            if not decoded:
-                print("❌ Không thể decode fall_raw binary")
-                return
-            
-            # ────────────────────────────────────────────────────────────────────────────
-            # Motion data (150 mẫu) → Build 11-feature matrix → Model inference
-            # ────────────────────────────────────────────────────────────────────────────
-            print(f"🧠 [MODEL] Đang xử lý {decoded['num_samples']} motion samples...")
-            result = _process_fall_raw_with_model(decoded, pending_alert)
-            
-            if result:
-                if result['detected']:
-                    print(f"🚨 [RESULT] ✅ TẾ NGÃ XÁC NHẬN! | Confidence: {result['confidence']:.3f}")
-                else:
-                    print(f"✓ [RESULT] Không phải ngã | Confidence: {result['confidence']:.3f}")
-                
+
+                # Pause health updates while fall model is running (default 5s).
+                if FALL_MODEL_BLOCK_MS > 0:
+                    print(f"⏸️  Tạm dừng {FALL_MODEL_BLOCK_MS}ms để xử lý fall model")
+                    time.sleep(FALL_MODEL_BLOCK_MS / 1000.0)
+
                 # ────────────────────────────────────────────────────────────────────────
-                # Kết hợp fall detection result với health vitals cuối cùng
-                # → Emit SINGLE "health_update" event (không tách thành 2 responses)
+                # Motion data (150 mẫu) → Build 11-feature matrix → Model inference
                 # ────────────────────────────────────────────────────────────────────────
-                health_with_fall = _build_health_update_with_fall(result)
-                
-                if health_with_fall:
-                    # 💓 Gửi MỘT response duy nhất: health_update (kết hợp fall + vitals)
-                    _append_history(health_with_fall)
-                    _emit_with_delay("health_update", health_with_fall, delay_ms=WS_FALL_EMIT_DELAY_MS)
-                    
-                    fall_status = "TE_NGA" if result['detected'] else "NO_FALL"
-                    print(f"💓 [RESPONSE] {fall_status} | BPM={health_with_fall['data'].get('bpm')} "
-                          f"SpO2={health_with_fall['data'].get('spo2')}% Temp={health_with_fall['data'].get('temp')}°C")
-                    
-                    # Nếu ngã được xác nhận → kích hoạt cảnh báo trên thiết bị
+                print(f"🧠 [MODEL] Đang xử lý {decoded['num_samples']} motion samples...")
+                result = _process_fall_raw_with_model(decoded, pending_alert)
+
+                if result:
                     if result['detected']:
-                        _send_device_command("buzzer_on", duration_ms=5000)
-                else:
-                    print("⚠️  Không thể kết hợp fall detection với health vitals")
-            
+                        print(f"🚨 [RESULT] ✅ TẾ NGÃ XÁC NHẬN! | Confidence: {result['confidence']:.3f}")
+                    else:
+                        print(f"✓ [RESULT] Không phải ngã | Confidence: {result['confidence']:.3f}")
+
+                    # ────────────────────────────────────────────────────────────────
+                    # Kết hợp fall detection result với health vitals cuối cùng
+                    # → Emit SINGLE "health_update" event (không tách thành 2 responses)
+                    # ────────────────────────────────────────────────────────────────
+                    health_with_fall = _build_health_update_with_fall(result)
+
+                    if health_with_fall:
+                        # Persist latest packet so API can return this combined result
+                        with _packet_lock:
+                            _latest_packet = health_with_fall
+                            # leave _latest_raw_payload unchanged (no raw sensor/data for fall_raw)
+
+                        # 💓 Gửi MỘT response duy nhất: health_update (kết hợp fall + vitals)
+                        _append_history(health_with_fall)
+                        _emit_with_delay("health_update", health_with_fall, delay_ms=WS_FALL_EMIT_DELAY_MS)
+
+                        fall_status = "TE_NGA" if result['detected'] else "NO_FALL"
+                        print(f"💓 [RESPONSE] {fall_status} | BPM={health_with_fall['data'].get('bpm')} "
+                              f"SpO2={health_with_fall['data'].get('spo2')}% Temp={health_with_fall['data'].get('temp')}°C")
+
+                        # Nếu ngã được xác nhận → kích hoạt cảnh báo trên thiết bị
+                        if result['detected']:
+                            _send_device_command("buzzer_on", duration_ms=5000)
+                    else:
+                        print("⚠️  Không thể kết hợp fall detection với health vitals")
+            finally:
+                with _fall_raw_state_lock:
+                    _waiting_for_fall_raw = False
+
             return
 
         # ════════════════════════════════════════════════════════════════════════════════
@@ -656,7 +939,12 @@ def on_message(client, userdata, msg):
         if SENSOR_INPUT_PROCESS_DELAY_MS > 0:
             time.sleep(SENSOR_INPUT_PROCESS_DELAY_MS / 1000.0)
         
-        raw = msg.payload.decode()
+        try:
+            raw = msg.payload.decode(errors='replace')
+        except Exception as e:
+            print(f"❌ Payload khong hop le: loi giai ma binary - {e}")
+            return
+        
         try:
             raw_payload = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -672,7 +960,20 @@ def on_message(client, userdata, msg):
         latest_packet = None
         for health_data in health_samples:
             # Classify health status based on vitals
-            status = classify(health_data.heart_rate, health_data.temp)
+            # Use last-valid vitals as fallback for classification when current sample missing/zero
+            with _latest_vitals_lock:
+                hr_for_status = (
+                    health_data.heart_rate
+                    if _is_valid_vital_value("heart_rate", health_data.heart_rate)
+                    else _last_valid_vitals.get("heart_rate")
+                )
+                temp_for_status = (
+                    health_data.temp
+                    if _is_valid_vital_value("temp", health_data.temp)
+                    else _last_valid_vitals.get("temp")
+                )
+
+            status = classify(hr_for_status, temp_for_status, health_data.spo2)
             
             packet = _to_flutter_packet(health_data, msg.topic)
             
@@ -680,8 +981,57 @@ def on_message(client, userdata, msg):
             packet["data"]["status"] = status
             latest_packet = packet
 
+            # Send buzzer pattern whenever a bad status appears
+      
+            # Update preserved last-valid vitals after building packet
+            with _latest_vitals_lock:
+                if _is_valid_vital_value("heart_rate", health_data.heart_rate):
+                    _last_valid_vitals["heart_rate"] = float(health_data.heart_rate)
+                if _is_valid_vital_value("spo2", health_data.spo2):
+                    _last_valid_vitals["spo2"] = float(health_data.spo2)
+                # temp update via specialized function, but also preserve here
+                if _is_valid_vital_value("temp", health_data.temp):
+                    _last_valid_vitals["temp"] = float(health_data.temp)
+        # _handle_alert_for_batch(health_samples)
+        _handle_alert_over_5_batches(health_samples)
+        # _update_vital_windows(health_samples)
+        # _check_window_alerts()
         if latest_packet is not None:
             with _packet_lock:
+                # If incoming packet reports BPM==0 or None, preserve previous valid BPM
+                try:
+                    bpm_val = latest_packet.get("data", {}).get("bpm")
+                except Exception:
+                    bpm_val = None
+
+                if bpm_val is None or bpm_val == 0:
+                    if _latest_hr is not None and _latest_hr > 0:
+                        latest_packet["data"]["bpm"] = _latest_hr
+                        bpm_val = _latest_hr
+
+                # Update stored latest vitals (only when meaningful)
+                if bpm_val is not None:
+                    try:
+                        _latest_hr = float(bpm_val)
+                    except Exception:
+                        pass
+
+                try:
+                    spo2_val = latest_packet.get("data", {}).get("spo2")
+                except Exception:
+                    spo2_val = None
+
+                if spo2_val is None:
+                    if _latest_spo2 is not None and _latest_spo2 > 0:
+                        latest_packet["data"]["spo2"] = _latest_spo2
+                        spo2_val = _latest_spo2
+
+                if spo2_val is not None:
+                    try:
+                        _latest_spo2 = float(spo2_val)
+                    except Exception:
+                        pass
+
                 _latest_packet = latest_packet
                 _latest_raw_payload = normalized_raw_payload
 
@@ -738,7 +1088,163 @@ def _send_device_command(cmd: str, **kwargs):
                 print(f"❌ Failed to send command: {result.rc}")
     except Exception as exc:
         print(f"❌ Error sending command: {exc}")
+def _check_window_alerts():
+    global _last_alert_time
 
+    now = time.time()
+
+    # cooldown tránh spam
+    if now - _last_alert_time < ALERT_COOLDOWN_S:
+        return
+
+    with _window_lock:
+        bpm_window = list(_vital_windows["bpm"])
+        spo2_window = list(_vital_windows["spo2"])
+        temp_window = list(_vital_windows["temp"])
+
+    if not bpm_window and not spo2_window and not temp_window:
+        return
+
+    bpm_abnormal = 0
+    spo2_abnormal = 0
+    temp_abnormal = 0
+
+    # đếm số mẫu abnormal
+    for v in bpm_window:
+        if _is_vital_abnormal("bpm", v):
+            bpm_abnormal += 1
+
+    for v in spo2_window:
+        if _is_vital_abnormal("spo2", v):
+            spo2_abnormal += 1
+
+    for v in temp_window:
+        if _is_vital_abnormal("temp", v):
+            temp_abnormal += 1
+
+    triggered = []
+
+    # ví dụ:
+    # 70% samples trong window bị abnormal mới trigger
+
+    if len(bpm_window) >= 5:
+        if bpm_abnormal / len(bpm_window) >= 0.7:
+            triggered.append("bpm")
+
+    if len(spo2_window) >= 5:
+        if spo2_abnormal / len(spo2_window) >= 0.7:
+            triggered.append("spo2")
+
+    if len(temp_window) >= 5:
+        if temp_abnormal / len(temp_window) >= 0.7:
+            triggered.append("temp")
+
+    if triggered:
+        print(f"🚨 ALERT WINDOW: {triggered}")
+
+        _last_alert_time = now
+
+        _fire_beep_pattern()
+def _is_vital_abnormal(key: str, value) -> bool:
+    """Kiểm tra xem một vital có vượt ngưỡng không.
+ 
+    Returns True nếu value < LOW hoặc value > HIGH.
+    Returns False nếu value là None (không đủ dữ liệu → không trigger).
+    """
+    if value is None:
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    thresholds = VITAL_THRESHOLDS.get(key, {})
+    low  = thresholds.get("low")
+    high = thresholds.get("high")
+    if low is not None and v < low:
+        return True
+    if high is not None and v > high:
+        return True
+    return False
+ 
+def _update_vital_windows(health_samples):
+    global _vital_windows
+
+    if not health_samples:
+        return
+
+    last_bpm = None
+    last_spo2 = None
+    last_temp = None
+
+    for sample in health_samples:
+        if _is_valid_vital_value("heart_rate", getattr(sample, "heart_rate", None)):
+            last_bpm = float(sample.heart_rate)
+
+        if _is_valid_vital_value("spo2", getattr(sample, "spo2", None)):
+            last_spo2 = float(sample.spo2)
+
+        if _is_valid_vital_value("temp", getattr(sample, "temp", None)):
+            last_temp = float(sample.temp)
+
+    with _window_lock:
+        if last_bpm is not None:
+            _vital_windows["bpm"].append(last_bpm)
+
+        if last_spo2 is not None:
+            _vital_windows["spo2"].append(last_spo2)
+
+        if last_temp is not None:
+            _vital_windows["temp"].append(last_temp)
+def _cancel_alert_timers():
+    """Huỷ tất cả timer buzzer đang pending."""
+    with _alert_timers_lock:
+        for t in _alert_timers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        _alert_timers.clear()
+ 
+ 
+def _fire_beep_pattern():
+    """
+    Gửi chuỗi lệnh buzzer_on theo tần số trong ALERT_BEEP_DURATION_S giây.
+    Mỗi beep = buzzer_on(duration=ALERT_BEEP_ON_MS), cách nhau ALERT_BEEP_OFF_MS.
+    Toàn bộ pattern kéo dài ~ALERT_BEEP_DURATION_S giây.
+    """
+    cycle_ms = ALERT_BEEP_ON_MS + ALERT_BEEP_OFF_MS
+    total_ms = ALERT_BEEP_DURATION_S * 1000
+    count    = max(1, int(total_ms / cycle_ms))
+ 
+    _cancel_alert_timers()
+ 
+    with _alert_timers_lock:
+        for i in range(count):
+            delay_s = i * cycle_ms / 1000.0
+            t = Timer(
+                delay_s,
+                _send_device_command,
+                kwargs={"cmd": "buzzer_on", "duration_ms": ALERT_BEEP_ON_MS},
+            )
+            t.daemon = True
+            _alert_timers.append(t)
+            t.start()
+ 
+    print(
+        f"🔔 [BUZZER] Pattern started: {count} beeps × {ALERT_BEEP_ON_MS}ms ON / "
+        f"{ALERT_BEEP_OFF_MS}ms OFF, total ~{ALERT_BEEP_DURATION_S}s"
+    )
+ 
+def _stop_buzzer():
+    global _buzzer_active
+
+    _cancel_alert_timers()
+
+    _send_device_command("buzzer_off")
+
+    _buzzer_active = False
+
+    print("🔕 [BUZZER] Stopped")
 
 def build_mqtt_client():
     client = mqtt.Client(
@@ -755,22 +1261,7 @@ def build_mqtt_client():
     return client
 
 
-@app.get("/api/health/latest")
-def get_latest_health():
-    output_format = request.args.get("format", "packet").strip().lower()
-
-    if output_format not in ("packet", "raw"):
-        return jsonify({"message": "Tham so 'format' chi chap nhan: packet, raw"}), 400
-
-    with _packet_lock:
-        if output_format == "raw":
-            if _latest_raw_payload is None:
-                return jsonify({"message": "Chua nhan duoc du lieu raw"}), 404
-            return jsonify(_latest_raw_payload)
-
-        if _latest_packet is None:
-            return jsonify({"message": "Chua nhan duoc du lieu suc khoe"}), 404
-        return jsonify(_latest_packet)
+# NOTE: `/api/health/latest` endpoint removed by request. Use `/api/health/history` to fetch recent records.
 
 
 @app.get("/api/docs")
@@ -785,18 +1276,6 @@ def get_api_docs():
                     "method": "GET",
                     "path": "/api/docs",
                     "description": "Tai lieu API cho frontend.",
-                },
-                {
-                    "method": "GET",
-                    "path": "/api/health/latest",
-                    "description": "Lay goi du lieu suc khoe moi nhat.",
-                    "query": {
-                        "format": {
-                            "type": "string",
-                            "allowed": ["packet", "raw"],
-                            "default": "packet",
-                        }
-                    },
                 },
                 {
                     "method": "GET",
@@ -832,10 +1311,6 @@ def get_api_docs():
                         },
                     },
                     {
-                        "event": "sensor_alert",
-                        "description": "Canh bao checking tu luong phat hien nga truoc khi co ket qua AI.",
-                    },
-                    {
                         "event": "health_error",
                         "description": "Loi parse/validate payload MQTT.",
                     },
@@ -843,7 +1318,7 @@ def get_api_docs():
             },
             "notes": [
                 "Frontend nen uu tien nghe health_update theo thoi gian thuc.",
-                "Neu can debug raw payload tu ESP32, goi /api/health/latest?format=raw.",
+                "Neu can debug raw payload tu ESP32, lay ban ghi moi nhat tu /api/health/history.",
                 "Gia tri BPM co the la 0 khi tin hieu IR khong du chat luong de detect peak.",
             ],
         }
@@ -899,9 +1374,9 @@ def main():
         traceback.print_exc()
         raise
     finally:
-        if mqtt_started:
-            client.loop_stop()
-            client.disconnect()
+        if mqtt_started and _mqtt_client:
+            _mqtt_client.loop_stop()
+            _mqtt_client.disconnect()
 
 
 if __name__ == "__main__":
