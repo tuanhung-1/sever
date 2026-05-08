@@ -68,7 +68,7 @@ BROKER = "11060dbd13b54fc988ae8f9bfc43c089.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 USERNAME = "heart-rate"
 PASSWORD = "aB123456"
-CLIENT_ID = "python_backend1dsdsd"
+CLIENT_ID = "python_backend1dsdssdaasdasdd"
 MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "192.168.1.23")
@@ -89,7 +89,7 @@ API_PORT = _resolve_api_port()
 SENSOR_INPUT_PROCESS_DELAY_MS = max(0, int(os.getenv("SENSOR_INPUT_PROCESS_DELAY_MS", "0")))
 WS_HEALTH_EMIT_DELAY_MS = max(0, int(os.getenv("WS_HEALTH_EMIT_DELAY_MS", "120")))
 WS_FALL_EMIT_DELAY_MS = max(0, int(os.getenv("WS_FALL_EMIT_DELAY_MS", "0")))
-FALL_MODEL_BLOCK_MS = max(0, int(os.getenv("FALL_MODEL_BLOCK_MS", "5000")))
+FALL_MODEL_BLOCK_MS = max(0, int(os.getenv("FALL_MODEL_BLOCK_MS", "1000")))
 BUZZER_BEEP_ON_MS = max(0, int(os.getenv("BUZZER_BEEP_ON_MS", "2000")))
 BUZZER_BEEP_OFF_MS = max(0, int(os.getenv("BUZZER_BEEP_OFF_MS", "1000")))
 BUZZER_BEEP_COUNT = max(1, int(os.getenv("BUZZER_BEEP_COUNT", "2")))
@@ -201,18 +201,10 @@ def _append_history(packet):
 
 def _handle_alert_over_3_batches(health_samples):
 
-    """
-    Logic alert:
-    - Giữ 3 batch gần nhất
-    - Trigger nếu:
-        + >=2/3 batch abnormal
-        + batch cuối phải abnormal
-    - Nếu batch cuối normal -> tắt buzzer
-    """
-
     global _last_alert_time
     global _buzzer_active
-    global _wait_next_normal_batch  
+    global _wait_next_normal_batch
+
     if not health_samples:
         return
 
@@ -241,7 +233,7 @@ def _handle_alert_over_3_batches(health_samples):
         ):
             last_temp = float(sample.temp)
 
-    batch_state = {
+    current_batch = {
         "bpm": _is_vital_abnormal("bpm", last_bpm),
         "spo2": _is_vital_abnormal("spo2", last_spo2),
         "temp": _is_vital_abnormal("temp", last_temp),
@@ -249,56 +241,69 @@ def _handle_alert_over_3_batches(health_samples):
 
     with _batch_alert_lock:
 
-        _vital_batch_buffer.append(batch_state)
+        _vital_batch_buffer.append(current_batch)
 
         # chưa đủ 3 batch
         if len(_vital_batch_buffer) < 3:
             return
 
-        latest = _vital_batch_buffer[-1]
-
-        bpm_count = sum(1 for b in _vital_batch_buffer if b["bpm"])
-        spo2_count = sum(1 for b in _vital_batch_buffer if b["spo2"])
-        temp_count = sum(1 for b in _vital_batch_buffer if b["temp"])
-
-    triggered = []
-
-    # ===== BPM =====
-    if latest["bpm"] and bpm_count >= 2:
-        triggered.append("bpm")
-
-    # ===== SpO2 =====
-    if latest["spo2"] and spo2_count >= 2:
-        triggered.append("spo2")
-
-    # ===== TEMP =====
-    if latest["temp"] and temp_count >= 2:
-        triggered.append("temp")
+        b1 = _vital_batch_buffer[0]
+        b2 = _vital_batch_buffer[1]
+        b3 = _vital_batch_buffer[2]   # latest
 
     # =====================================================
-    # Nếu batch cuối normal hết -> tắt buzzer
+    # Nếu batch mới nhất NORMAL hoàn toàn -> tắt còi
     # =====================================================
 
-    
-    if not triggered:
+    latest_normal = (
+        not b3["bpm"] and
+        not b3["spo2"] and
+        not b3["temp"]
+    )
 
-    # Nếu trước đó đã alert
-    # thì batch bình thường kế tiếp mới tắt
-        if _wait_next_normal_batch and _buzzer_active:
+    if latest_normal:
 
-            print("✅ Batch kế tiếp đã bình thường -> tắt còi")
+        if _buzzer_active:
+
+            print("✅ Batch mới nhất NORMAL -> tắt còi")
 
             _stop_buzzer()
-
-            _wait_next_normal_batch = False
 
         return
 
     # =====================================================
-    # Nếu đang kêu rồi -> không fire lại
+    # Nếu đang kêu rồi -> không trigger lại
     # =====================================================
 
     if _buzzer_active:
+        return
+
+    triggered = []
+
+    # =====================================================
+    # BPM
+    # latest abnormal
+    # và 1 trong 2 batch trước abnormal
+    # =====================================================
+
+    if b3["bpm"] and (b1["bpm"] or b2["bpm"]):
+        triggered.append("bpm")
+
+    # =====================================================
+    # SpO2
+    # =====================================================
+
+    if b3["spo2"] and (b1["spo2"] or b2["spo2"]):
+        triggered.append("spo2")
+
+    # =====================================================
+    # TEMP
+    # =====================================================
+
+    if b3["temp"] and (b1["temp"] or b2["temp"]):
+        triggered.append("temp")
+
+    if not triggered:
         return
 
     now = time.time()
@@ -310,14 +315,10 @@ def _handle_alert_over_3_batches(health_samples):
     _last_alert_time = now
 
     print(
-        f"🚨 ALERT 3-BATCH | "
-        f"BPM={bpm_count}/3 "
-        f"SpO2={spo2_count}/3 "
-        f"Temp={temp_count}/3"
+        f"🚨 ALERT 3-BATCH: {triggered}"
     )
 
     _buzzer_active = True
-    _wait_next_normal_batch = True
 
     _fire_beep_pattern()
 def _read_history(limit=50):
@@ -1073,63 +1074,7 @@ def _send_device_command(cmd: str, **kwargs):
                 print(f"❌ Failed to send command: {result.rc}")
     except Exception as exc:
         print(f"❌ Error sending command: {exc}")
-def _check_window_alerts():
-    global _last_alert_time
 
-    now = time.time()
-
-    # cooldown tránh spam
-    if now - _last_alert_time < ALERT_COOLDOWN_S:
-        return
-
-    with _window_lock:
-        bpm_window = list(_vital_windows["bpm"])
-        spo2_window = list(_vital_windows["spo2"])
-        temp_window = list(_vital_windows["temp"])
-
-    if not bpm_window and not spo2_window and not temp_window:
-        return
-
-    bpm_abnormal = 0
-    spo2_abnormal = 0
-    temp_abnormal = 0
-
-    # đếm số mẫu abnormal
-    for v in bpm_window:
-        if _is_vital_abnormal("bpm", v):
-            bpm_abnormal += 1
-
-    for v in spo2_window:
-        if _is_vital_abnormal("spo2", v):
-            spo2_abnormal += 1
-
-    for v in temp_window:
-        if _is_vital_abnormal("temp", v):
-            temp_abnormal += 1
-
-    triggered = []
-
-    # ví dụ:
-    # 70% samples trong window bị abnormal mới trigger
-
-    if len(bpm_window) >= 5:
-        if bpm_abnormal / len(bpm_window) >= 0.7:
-            triggered.append("bpm")
-
-    if len(spo2_window) >= 5:
-        if spo2_abnormal / len(spo2_window) >= 0.7:
-            triggered.append("spo2")
-
-    if len(temp_window) >= 5:
-        if temp_abnormal / len(temp_window) >= 0.7:
-            triggered.append("temp")
-
-    if triggered:
-        print(f"🚨 ALERT WINDOW: {triggered}")
-
-        _last_alert_time = now
-
-        _fire_beep_pattern()
 def _is_vital_abnormal(key: str, value) -> bool:
     """Kiểm tra xem một vital có vượt ngưỡng không.
  
@@ -1151,35 +1096,6 @@ def _is_vital_abnormal(key: str, value) -> bool:
         return True
     return False
  
-def _update_vital_windows(health_samples):
-    global _vital_windows
-
-    if not health_samples:
-        return
-
-    last_bpm = None
-    last_spo2 = None
-    last_temp = None
-
-    for sample in health_samples:
-        if _is_valid_vital_value("heart_rate", getattr(sample, "heart_rate", None)):
-            last_bpm = float(sample.heart_rate)
-
-        if _is_valid_vital_value("spo2", getattr(sample, "spo2", None)):
-            last_spo2 = float(sample.spo2)
-
-        if _is_valid_vital_value("temp", getattr(sample, "temp", None)):
-            last_temp = float(sample.temp)
-
-    with _window_lock:
-        if last_bpm is not None:
-            _vital_windows["bpm"].append(last_bpm)
-
-        if last_spo2 is not None:
-            _vital_windows["spo2"].append(last_spo2)
-
-        if last_temp is not None:
-            _vital_windows["temp"].append(last_temp)
 def _cancel_alert_timers():
     """Huỷ tất cả timer buzzer đang pending."""
     with _alert_timers_lock:
