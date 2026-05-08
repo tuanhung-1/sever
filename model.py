@@ -12,21 +12,23 @@ import numpy as np
 
 # ─── Classification thresholds ───────────────────────────────────────────────
 # Temperature (theo MAX30205 datasheet + lâm sàng)
-TEMP_FEVER_THRESHOLD = 39.5   # °C - Sốt (công thức)
+TEMP_FEVER_THRESHOLD = 39.5   # °C - Sot (cong thuc)
+TEMP_LOW_THRESHOLD = 32.5     # °C - Low temp (hypothermia)
 
 # Heart Rate (theo công thức)
 BPM_HIGH_THRESHOLD = 120.0    # beats per minute - Nguy hiểm
-BPM_LOW_THRESHOLD = 60.0      # beats per minute - Thấp
+BPM_LOW_THRESHOLD = 50.0      # beats per minute - Thap
 BPM_DELTA_THRESHOLD = 20.0    # Δ BPM > 20 → Bất thường
 
 # SpO₂ (độ bão hòa oxy)
-SPO2_LOW_THRESHOLD = 92.0   # % - Thap (canh bao)
+SPO2_LOW_THRESHOLD = 93.0   # % - Thap (canh bao)
 
 # ─── Result labels ────────────────────────────────────────────────────────────
 STATUS_FEVER = "FEVER"
 STATUS_HIGH_HEART_RATE = "HIGH_HEART_RATE"
 STATUS_LOW_HEART_RATE = "LOW_HEART_RATE"
 STATUS_LOW_SPO2 = "LOW_SPO2"
+STATUS_LOW_TEMP = "LOW_TEMP"
 STATUS_FALL_DETECTED = "FALL_DETECTED"  # ← Trạng thái mới (ngã phát hiện)
 STATUS_NORMAL = "NORMAL"
 
@@ -626,6 +628,9 @@ def from_json_samples(raw: str) -> List[HealthData]:
 # ─── Classification ──────────────────────────────────────────────────────────
 def classify(bpm, temp, spo2) -> List[str]:
     statuses = []
+
+    if temp < TEMP_LOW_THRESHOLD:
+        statuses.append(STATUS_LOW_TEMP)
 
     if temp > TEMP_FEVER_THRESHOLD:
         statuses.append(STATUS_FEVER)
