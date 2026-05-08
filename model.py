@@ -12,22 +12,21 @@ import numpy as np
 
 # ─── Classification thresholds ───────────────────────────────────────────────
 # Temperature (theo MAX30205 datasheet + lâm sàng)
-TEMP_FEVER_THRESHOLD = 37.5   # °C - Sốt (công thức)
-TEMP_DANGER_THRESHOLD = 35.0  # °C - Hypothermia (nguy hiểm)
+TEMP_FEVER_THRESHOLD = 39.5   # °C - Sốt (công thức)
 
 # Heart Rate (theo công thức)
 BPM_HIGH_THRESHOLD = 120.0    # beats per minute - Nguy hiểm
-BPM_LOW_THRESHOLD = 50.0      # beats per minute - Thấp
+BPM_LOW_THRESHOLD = 60.0      # beats per minute - Thấp
 BPM_DELTA_THRESHOLD = 20.0    # Δ BPM > 20 → Bất thường
 
 # SpO₂ (độ bão hòa oxy)
-SPO2_WARNING_THRESHOLD = 95.0  # % - Cảnh báo
-SPO2_DANGER_THRESHOLD = 90.0   # % - Nguy hiểm
+SPO2_LOW_THRESHOLD = 92.0   # % - Thap (canh bao)
 
 # ─── Result labels ────────────────────────────────────────────────────────────
 STATUS_FEVER = "FEVER"
 STATUS_HIGH_HEART_RATE = "HIGH_HEART_RATE"
 STATUS_LOW_HEART_RATE = "LOW_HEART_RATE"
+STATUS_LOW_SPO2 = "LOW_SPO2"
 STATUS_FALL_DETECTED = "FALL_DETECTED"  # ← Trạng thái mới (ngã phát hiện)
 STATUS_NORMAL = "NORMAL"
 
@@ -59,12 +58,12 @@ class HealthData:
 
     @property
     def status(self) -> str:
-        return classify(self.heart_rate, self.temp)
+        return classify(self.heart_rate, self.temp, self.spo2)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["status"] = self.status
-        payload["bpm"] = int(round(payload["heart_rate"]))
+        payload["bpm"] = int(round(payload["heart_rate"])) if payload["heart_rate"] is not None else None
         payload["ts"] = payload["timestamp"]
         return payload
 
@@ -110,8 +109,15 @@ def _to_optional_int_list(value: Any, field_name: str, expected_len: int) -> Lis
         return None
     if not isinstance(value, list):
         raise ValueError(f"Truong '{field_name}' khong hop le, can mang JSON")
+    
+    # Nếu độ dài không khớp, cắt hoặc pad với 0
     if len(value) != expected_len:
-        raise ValueError(f"Truong '{field_name}' phai co {expected_len} phan tu")
+        if len(value) > expected_len:
+            print(f"⚠️  Truong '{field_name}' co {len(value)} phan tu, cat ve {expected_len}")
+            value = value[:expected_len]
+        else:
+            print(f"⚠️  Truong '{field_name}' co {len(value)} phan tu, pad them {expected_len - len(value)} gia tri 0")
+            value = value + [0] * (expected_len - len(value))
 
     return [_to_int(item, field_name) for item in value]
 
@@ -169,20 +175,43 @@ def _infer_sample_interval_ms(
 def _sanitize_optical_series(values: List[int]) -> List[int]:
     if not values:
         return values
+    # Keep series as-is; do not forward-fill missing/zero values here.
+    # Upstream logic will treat values <= 0 as invalid and handle segments.
+    return list(values)
 
-    sanitized = list(values)
-    first_valid = next((v for v in sanitized if v > 0), None)
-    if first_valid is None:
-        return sanitized
 
-    last_valid = first_valid
-    for idx, value in enumerate(sanitized):
-        if value > 0:
-            last_valid = value
+def _split_contiguous_valid_segments(values: List[int] | None, min_valid_value: int = 1) -> list:
+    """Return list of (start_index, segment_values) for contiguous runs where value >= min_valid_value.
+
+    If `values` is None, returns empty list.
+    """
+    if values is None:
+        return []
+    segments = []
+    start = None
+    buf = []
+    for i, v in enumerate(values):
+        try:
+            valid = (v is not None) and (int(v) >= min_valid_value)
+        except Exception:
+            valid = False
+
+        if valid:
+            if start is None:
+                start = i
+                buf = [int(v)]
+            else:
+                buf.append(int(v))
         else:
-            sanitized[idx] = last_valid
+            if start is not None:
+                segments.append((start, buf))
+                start = None
+                buf = []
 
-    return sanitized
+    if start is not None and buf:
+        segments.append((start, buf))
+
+    return segments
 
 
 def _remove_dc(signal: np.ndarray, window_size: int) -> np.ndarray:
@@ -204,15 +233,32 @@ def _bandpass_fft(signal: np.ndarray, sample_rate_hz: float, low_hz: float, high
 
 
 def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> float | None:
-    if len(ir_values) < 20:
+    # Allow lists that contain invalid points (0 or None) by splitting into contiguous valid segments
+    if not ir_values:
         return None
 
-    signal = np.array(ir_values, dtype=np.float64)
-    signal_std = np.std(signal)
-    
-    # If signal has no variation, can't detect heartbeat
-    if signal_std < 100:
-        print(f"⚠️  IR signal co std = {signal_std:.2f} (qua thap, ko phat hien duoc nhip tim)")
+    segments = _split_contiguous_valid_segments(ir_values, min_valid_value=1)
+    if not segments:
+        return None
+
+    # Choose best segment: prefer longest one
+    best_start, best_seg = max(segments, key=lambda s: len(s[1]))
+    if len(best_seg) < 20:
+        # Try next longest segment if exists
+        longer = [seg for seg in segments if len(seg[1]) >= 20]
+        if not longer:
+            return None
+        best_start, best_seg = max(longer, key=lambda s: len(s[1]))
+
+    signal = np.array(best_seg, dtype=np.float64)
+    if signal.size < 20:
+        return None
+
+    signal_std = float(np.std(signal))
+    mean_signal = float(np.mean(np.abs(signal)))
+    rel_std = signal_std / mean_signal if mean_signal > 0 else 0.0
+    if mean_signal <= 1e-6 or rel_std < 1e-4:
+        print(f"⚠️  IR segment too low variation: std={signal_std:.2f}, mean={mean_signal:.2f}")
         return None
 
     sample_rate_hz = _sample_rate_hz(sample_interval_ms)
@@ -222,7 +268,7 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
 
     filtered_std = float(np.std(filtered))
     if filtered_std <= 1e-6:
-        print("⚠️  IR filtered std qua thap, bo qua BPM")
+        print("⚠️  IR filtered std too low, skip BPM")
         return None
 
     normalized = filtered / filtered_std
@@ -243,13 +289,13 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
             peaks[-1] = idx
 
     if len(peaks) < 2:
-        print(f"⚠️  Khong phat hien duoc peaks trong IR signal (found {len(peaks)} peaks)")
+        print(f"⚠️  Not enough peaks in IR segment (found {len(peaks)})")
         return None
 
     rr_seconds = np.diff(peaks) / sample_rate_hz
     rr_seconds = rr_seconds[(rr_seconds > 0.25) & (rr_seconds < 2.0)]
     if rr_seconds.size == 0:
-        print(f"⚠️  Peak intervals ko hop le, ko tinh duoc BPM")
+        print(f"⚠️  Peak intervals invalid, cannot compute BPM")
         return None
 
     bpm = 60.0 / float(np.median(rr_seconds))
@@ -269,11 +315,38 @@ def _estimate_spo2_from_ir_red(
       AC = RMS(signal - DC) = sqrt(mean((signal - DC)²))
       SpO₂ = 110 - 25 × (AC_red/DC_red) / (AC_ir/DC_ir)
     """
-    if len(ir_values) < 20 or len(red_values) < 20:
+    # Find overlapping valid contiguous segments where both IR and RED >=1
+    ir_segs = _split_contiguous_valid_segments(ir_values, min_valid_value=1)
+    red_segs = _split_contiguous_valid_segments(red_values, min_valid_value=1)
+    if not ir_segs or not red_segs:
         return None
 
-    ir = np.array(ir_values, dtype=np.float64)
-    red = np.array(red_values, dtype=np.float64)
+    # Build list of overlapping segments (start index relative to original arrays)
+    best_segment = None
+    best_len = 0
+    for i_start, i_seg in ir_segs:
+        i_end = i_start + len(i_seg) - 1
+        for r_start, r_seg in red_segs:
+            r_end = r_start + len(r_seg) - 1
+            # overlap region
+            overlap_start = max(i_start, r_start)
+            overlap_end = min(i_end, r_end)
+            if overlap_end - overlap_start + 1 >= 20:
+                length = overlap_end - overlap_start + 1
+                if length > best_len:
+                    # extract overlapping slices
+                    ir_slice = [int(v) for v in ir_values[overlap_start:overlap_end+1]]
+                    red_slice = [int(v) for v in red_values[overlap_start:overlap_end+1]]
+                    best_segment = (overlap_start, ir_slice, red_slice)
+                    best_len = length
+
+    if best_segment is None:
+        return None
+
+    _, ir_slice, red_slice = best_segment
+
+    ir = np.array(ir_slice, dtype=np.float64)
+    red = np.array(red_slice, dtype=np.float64)
 
     sample_rate_hz = _sample_rate_hz(sample_interval_ms)
     dc_window = max(2, int(sample_rate_hz * 1.0))
@@ -295,9 +368,9 @@ def _estimate_spo2_from_ir_red(
 
     # Ratio: (AC_red/DC_red) / (AC_ir/DC_ir)
     ratio = (red_ac / red_dc) / (ir_ac / ir_dc)
-    
-    # SpO₂ công thức
-    spo2 = 110.0 - 25.0 * ratio
+
+    # SpO₂ formula
+    spo2 = 120.0 - 25.0 * ratio
     return float(np.clip(spo2, MIN_SPO2, MAX_SPO2))
 
 
@@ -403,13 +476,18 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     series_map: Dict[str, List[float]] = {}
     for key in ("ax", "ay", "az", "gx", "gy", "gz"):
         if key in normalized and normalized[key] is not None:
-            series_map[key] = _to_float_list(normalized[key], key)
+            values = _to_float_list(normalized[key], key)
+            # Nếu độ dài không khớp, cắt hoặc pad
+            if len(values) != sample_count:
+                if len(values) > sample_count:
+                    print(f"⚠️  Truong '{key}' co {len(values)} phan tu, cat ve {sample_count}")
+                    values = values[:sample_count]
+                else:
+                    print(f"⚠️  Truong '{key}' co {len(values)} phan tu, pad them {sample_count - len(values)} gia tri 0.0")
+                    values = values + [0.0] * (sample_count - len(values))
+            series_map[key] = values
         else:
             series_map[key] = [0.0] * sample_count
-
-    for key in ("ax", "ay", "az", "gx", "gy", "gz"):
-        if len(series_map[key]) != sample_count:
-            raise ValueError(f"Cac truong mang phai cung do dai, loi tai '{key}'")
 
     ir_series = None
     if normalized.get("ir") is not None:
@@ -436,23 +514,31 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
 
     temp_value = _to_float(normalized.get("temp", 0.0), "temp")
 
-    clean_ir_series = _sanitize_optical_series(ir_series) if ir_series is not None else None
-    clean_red_series = _sanitize_optical_series(red_series) if red_series is not None else None
+    # Mark invalid optical samples (<=0) as None so estimators can skip them
+    raw_ir_series = _sanitize_optical_series(ir_series) if ir_series is not None else None
+    raw_red_series = _sanitize_optical_series(red_series) if red_series is not None else None
+
+    marked_ir_series = None
+    if raw_ir_series is not None:
+        marked_ir_series = [v if (v is not None and int(v) > 0) else None for v in raw_ir_series]
+
+    marked_red_series = None
+    if raw_red_series is not None:
+        marked_red_series = [v if (v is not None and int(v) > 0) else None for v in raw_red_series]
 
     heart_rate: float | None = None
     if _is_valid_vital(normalized.get("heart_rate")):
         heart_rate = _to_float(normalized["heart_rate"], "heart_rate")
-    elif clean_ir_series is not None:
-        heart_rate = _estimate_bpm_from_ir(clean_ir_series, sample_interval_ms)
+    elif marked_ir_series is not None:
+        heart_rate = _estimate_bpm_from_ir(marked_ir_series, sample_interval_ms)
 
-    if heart_rate is None:
-        heart_rate = 0.0
+    # preserve None if heart rate estimation failed so callers can display empty/missing value
 
     spo2_value: float | None = None
     if _is_valid_vital(normalized.get("spo2")):
         spo2_value = _to_float(normalized["spo2"], "spo2")
-    elif clean_ir_series is not None and clean_red_series is not None:
-        spo2_value = _estimate_spo2_from_ir_red(clean_ir_series, clean_red_series, sample_interval_ms)
+    elif marked_ir_series is not None and marked_red_series is not None:
+        spo2_value = _estimate_spo2_from_ir_red(marked_ir_series, marked_red_series, sample_interval_ms)
 
     samples: List[HealthData] = []
     for idx in range(sample_count):
@@ -468,8 +554,8 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
                 heart_rate=heart_rate,
                 spo2=spo2_value,
                 temp=temp_value,
-                ir=clean_ir_series[idx] if clean_ir_series is not None else None,
-                red=clean_red_series[idx] if clean_red_series is not None else None,
+                ir=marked_ir_series[idx] if marked_ir_series is not None else None,
+                red=marked_red_series[idx] if marked_red_series is not None else None,
                 timestamp=sample_timestamp,
             )
         )
@@ -538,24 +624,24 @@ def from_json_samples(raw: str) -> List[HealthData]:
 
 
 # ─── Classification ──────────────────────────────────────────────────────────
-def classify(bpm: float, temp: float) -> str:
-    """
-    Classify health status based on BPM and body temperature.
-    
-    Thresholds (công thức):
-    - Temperature: > 37.5°C (FEVER) | < 35°C (Hypothermia - nguy hiểm)
-    - BPM: > 120 (HIGH) | < 50 (LOW)
-    """
-    # Kiểm tra nhiệt độ (ưu tiên)
+def classify(bpm, temp, spo2) -> List[str]:
+    statuses = []
+
     if temp > TEMP_FEVER_THRESHOLD:
-        return STATUS_FEVER
-    if temp < TEMP_DANGER_THRESHOLD:
-        print(f"🚨 [HEALTH] HYPOTHERMIA: Temp = {temp:.1f}°C < {TEMP_DANGER_THRESHOLD}°C")
-    
-    # Kiểm tra nhịp tim
-    if bpm > BPM_HIGH_THRESHOLD:
-        return STATUS_HIGH_HEART_RATE
-    if bpm < BPM_LOW_THRESHOLD:
-        return STATUS_LOW_HEART_RATE
-    
-    return STATUS_NORMAL
+        statuses.append(STATUS_FEVER)
+
+    if bpm is not None:
+        if bpm < BPM_LOW_THRESHOLD:
+            statuses.append(STATUS_LOW_HEART_RATE)
+
+        elif bpm > BPM_HIGH_THRESHOLD:
+            statuses.append(STATUS_HIGH_HEART_RATE)
+
+    if spo2 is not None:
+        if spo2 < SPO2_LOW_THRESHOLD:
+            statuses.append(STATUS_LOW_SPO2)
+
+    if not statuses:
+        statuses.append(STATUS_NORMAL)
+
+    return statuses
