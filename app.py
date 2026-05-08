@@ -20,15 +20,15 @@ from model import from_json_samples, classify, STATUS_FALL_DETECTED
 _buzzer_active = False
 _wait_next_normal_batch = False
 # Lưu lịch sử nhiều batch
-# Buffer lưu 5 batch gần nhất
-_vital_batch_buffer = deque(maxlen=4)
+# Buffer lưu 3 batch gần nhất
+_vital_batch_buffer = deque(maxlen=3)
 
 # Cooldown tránh spam
 _last_alert_time = 0
 ALERT_COOLDOWN_S = 20
 
 _batch_alert_lock = Lock()
-
+_window_lock = Lock()
 
 
 VITAL_THRESHOLDS = {
@@ -317,6 +317,7 @@ def _handle_alert_over_3_batches(health_samples):
     )
 
     _buzzer_active = True
+    _wait_next_normal_batch = True
 
     _fire_beep_pattern()
 def _read_history(limit=50):
@@ -977,7 +978,7 @@ def on_message(client, userdata, msg):
                 if _is_valid_vital_value("temp", health_data.temp):
                     _last_valid_vitals["temp"] = float(health_data.temp)
         # _handle_alert_for_batch(health_samples)
-        _handle_alert_over_5_batches(health_samples)
+        _handle_alert_over_3_batches(health_samples)
         # _update_vital_windows(health_samples)
         # _check_window_alerts()
         if latest_packet is not None:
