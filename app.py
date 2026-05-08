@@ -68,7 +68,7 @@ BROKER = "11060dbd13b54fc988ae8f9bfc43c089.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 USERNAME = "heart-rate"
 PASSWORD = "aB123456"
-CLIENT_ID = "python_backend1"
+CLIENT_ID = "python_backend1dsdsd"
 MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "192.168.1.23")
@@ -199,13 +199,13 @@ def _append_history(packet):
         with open(HISTORY_FILE, "a", encoding="utf-8") as file:
             file.write(json.dumps(history_line, ensure_ascii=False) + "\n")
 
-def _handle_alert_over_5_batches(health_samples):
+def _handle_alert_over_3_batches(health_samples):
 
     """
     Logic alert:
-    - Giữ 4 batch gần nhất
+    - Giữ 3 batch gần nhất
     - Trigger nếu:
-        + >=3/4 batch abnormal
+        + >=2/3 batch abnormal
         + batch cuối phải abnormal
     - Nếu batch cuối normal -> tắt buzzer
     """
@@ -251,8 +251,8 @@ def _handle_alert_over_5_batches(health_samples):
 
         _vital_batch_buffer.append(batch_state)
 
-        # chưa đủ 4 batch
-        if len(_vital_batch_buffer) < 4:
+        # chưa đủ 3 batch
+        if len(_vital_batch_buffer) < 3:
             return
 
         latest = _vital_batch_buffer[-1]
@@ -310,10 +310,10 @@ def _handle_alert_over_5_batches(health_samples):
     _last_alert_time = now
 
     print(
-        f"🚨 ALERT 4-BATCH | "
-        f"BPM={bpm_count}/4 "
-        f"SpO2={spo2_count}/4 "
-        f"Temp={temp_count}/4"
+        f"🚨 ALERT 3-BATCH | "
+        f"BPM={bpm_count}/3 "
+        f"SpO2={spo2_count}/3 "
+        f"Temp={temp_count}/3"
     )
 
     _buzzer_active = True
@@ -460,7 +460,7 @@ def _decode_fall_raw_binary(buf: bytes) -> dict | None:
 
 
 
-def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict | None:
+def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = None) -> dict | None:
  
     try:
         model = _get_fall_model()
@@ -524,6 +524,12 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict |
         
         print(f"🧠 [MODEL] Features=11 (150 motion) | Inference: confidence={confidence:.3f}, threshold={threshold} → detected={detected}")
         
+        alert_trigger = "fall_raw"
+
+        if alert_data:
+            alert_trigger = alert_data.get("trigger",
+        alert_data.get("message", "unknown"))
+        
         return {
             'detected': detected,
             'confidence': round(confidence, 3),
@@ -531,7 +537,7 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict) -> dict |
             'pre_samples': pre_samples,
             'trigger_ts': trigger_ts,
             'reason': reason,
-            'alert_trigger': alert_data.get("trigger", alert_data.get("message", "unknown")),
+            'alert_trigger': alert_trigger,
         }
     
     except Exception as e:
@@ -754,49 +760,27 @@ def _build_display_payload(normalized_data, fall_prediction):
 
 
 def _build_health_update_with_fall(fall_result: dict) -> dict | None:
-    """
-    Tạo health_update packet kết hợp fall detection result + health vitals cuối cùng.
-    Đảm bảo fall detection được ghi kèm theo tình trạng sức khỏe.
-    
-    Hòa nhập:
-    - Fall detection (AI model confidence)
-    - Latest vitals (BPM, SpO2, Temp, Status)
-    - Alert trigger reason
-    
-    Returns health_update packet hoặc None nếu không có vitals
-    """
+
     with _packet_lock:
         if _latest_packet is None:
-            print("⚠️  Không có health vitals để kết hợp với fall detection")
+            print("⚠️ Không có health vitals")
             return None
-        
-        # Clone packet cuối cùng
+
         latest = _latest_packet.copy()
-        
-        # Merge fall detection result vào data
-        latest["data"]["fall"] = {
+
+        # ===== FALL ROOT LEVEL =====
+        latest["fall"] = {
             "detected": fall_result.get("detected", False),
             "confidence": fall_result.get("confidence", 0.0),
-            "trigger": fall_result.get("alert_trigger", "unknown"),
-            "reason": fall_result.get("reason", ""),
         }
-        
-        # Update status nếu fall detected
-        if fall_result.get("detected"):
-            latest["data"]["status"] = STATUS_FALL_DETECTED
-        
-        # Metadata từ fall detection
-        latest["fall_detection"] = {
-            "timestamp": fall_result.get("trigger_ts"),
-            "num_samples": fall_result.get("num_samples"),
-            "pre_samples": fall_result.get("pre_samples"),
-            "model_version": "LSTM_v6",
-        }
-        
-        latest["server_timestamp"] = int(time.time())
-        
-        return latest
 
+        # ===== STATUS =====
+        if fall_result.get("detected"):
+            latest["data"]["status"] = ["FALL_DETECTED"]
+
+        latest["server_timestamp"] = int(time.time())
+
+        return latest
 
 def _to_flutter_packet(health_data, source_topic):
     """Build health_update packet from health_data.
