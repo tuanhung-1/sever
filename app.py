@@ -36,12 +36,12 @@ VITAL_THRESHOLDS = {
         "high": int(os.getenv("ALERT_BPM_HIGH", "120")),  # > 120 → tachycardia
     },
     "spo2": {
-        "low":  float(os.getenv("ALERT_SPO2_LOW",  "90.0")),  # < 90 → nguy hiểm
+        "low":  float(os.getenv("ALERT_SPO2_LOW",  "93.0")),  # < 93 → nguy hiểm
         "high": float(os.getenv("ALERT_SPO2_HIGH", "100.1")), # SpO2 không có high thực tế
     },
     "temp": {
-        "low":  float(os.getenv("ALERT_TEMP_LOW",  "35.0")),  # < 35 → hạ thân nhiệt
-        "high": float(os.getenv("ALERT_TEMP_HIGH", "37.5")),  # > 37.5 → sốt
+        "low":  float(os.getenv("ALERT_TEMP_LOW",  "32.5")),  # < 32.5 → hạ thân nhiệt
+        "high": float(os.getenv("ALERT_TEMP_HIGH", "39.5")),  # > 39.5 → sốt
     },
 }
  
@@ -254,11 +254,7 @@ def _handle_alert_over_3_batches(health_samples):
     # Nếu batch mới nhất NORMAL hoàn toàn -> tắt còi
     # =====================================================
 
-    latest_normal = (
-        not b3["bpm"] and
-        not b3["spo2"] and
-        not b3["temp"]
-    )
+    latest_normal = not any(b3.values())
 
     if latest_normal:
 
@@ -277,33 +273,15 @@ def _handle_alert_over_3_batches(health_samples):
     if _buzzer_active:
         return
 
-    triggered = []
+    b1_abnormal = any(b1.values())
+    b2_abnormal = any(b2.values())
+    b3_abnormal = any(b3.values())
 
-    # =====================================================
-    # BPM
-    # latest abnormal
-    # và 1 trong 2 batch trước abnormal
-    # =====================================================
-
-    if b3["bpm"] and (b1["bpm"] or b2["bpm"]):
-        triggered.append("bpm")
-
-    # =====================================================
-    # SpO2
-    # =====================================================
-
-    if b3["spo2"] and (b1["spo2"] or b2["spo2"]):
-        triggered.append("spo2")
-
-    # =====================================================
-    # TEMP
-    # =====================================================
-
-    if b3["temp"] and (b1["temp"] or b2["temp"]):
-        triggered.append("temp")
-
-    if not triggered:
+    # Require 3 consecutive abnormal batches (any vital) before triggering.
+    if not (b1_abnormal and b2_abnormal and b3_abnormal):
         return
+
+    triggered = [key for key, is_abnormal in b3.items() if is_abnormal]
 
     now = time.time()
 
@@ -1205,7 +1183,7 @@ def get_api_docs():
                                 "bpm": "number",
                                 "spo2": "number_or_null",
                                 "temp": "number",
-                                "status": "NORMAL|FEVER|HIGH_HEART_RATE|LOW_HEART_RATE|FALL_DETECTED",
+                                "status": "NORMAL|FEVER|LOW_TEMP|HIGH_HEART_RATE|LOW_HEART_RATE|LOW_SPO2|FALL_DETECTED",
                                 "fall": {"detected": "bool", "confidence": "number"},
                             },
                         },
