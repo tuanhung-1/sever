@@ -28,7 +28,6 @@ _last_alert_time = 0
 ALERT_COOLDOWN_S = 20
 
 _batch_alert_lock = Lock()
-_window_lock = Lock()
 
 
 VITAL_THRESHOLDS = {
