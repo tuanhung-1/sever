@@ -67,7 +67,7 @@ BROKER = "11060dbd13b54fc988ae8f9bfc43c089.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 USERNAME = "heart-rate"
 PASSWORD = "aB123456"
-CLIENT_ID = "python_backend1dsdssdaassdasdd"
+CLIENT_ID = "python_backend1dsdssdaassdsasdd"
 MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
 API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
 API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "192.168.1.23")
@@ -94,6 +94,94 @@ BUZZER_BEEP_ON_MS = max(0, int(os.getenv("BUZZER_BEEP_ON_MS", "2000")))
 BUZZER_BEEP_OFF_MS = max(0, int(os.getenv("BUZZER_BEEP_OFF_MS", "1000")))
 BUZZER_BEEP_COUNT = max(1, int(os.getenv("BUZZER_BEEP_COUNT", "2")))
 BUZZER_TOTAL_MS = max(0, int(os.getenv("BUZZER_TOTAL_MS", "60000")))
+
+
+# ==== PPG BUFFER FOR BPM CALCULATION ====
+_ppg_buffer = []  # List of dicts: {t, ir, red}
+_PPG_MAX_BUFFER = 300
+_PPG_MIN_CALC = 200
+_PPG_STEP_SIZE = 50 # Default, can be updated per payload
+_bpm_smooth_ppg = None
+_bpm_smooth_ppg_last = None
+_ppg_lock = Lock()
+
+def moving_average(arr, window_size):
+    result = []
+    for i in range(len(arr)):
+        sumv = 0
+        count = 0
+        for j in range(i - window_size, i + window_size + 1):
+            if 0 <= j < len(arr):
+                sumv += arr[j]
+                count += 1
+        result.append(sumv / count if count > 0 else arr[i])
+    return result
+
+def calculate_bpm_from_buffer(buffer):
+    if len(buffer) < _PPG_MIN_CALC:
+        return None
+    ir = [x['ir'] for x in buffer]
+    t = [x['t'] for x in buffer]
+    filtered = moving_average(ir, 2)
+    mean = sum(filtered) / len(filtered)
+    peaks = []
+    for i in range(1, len(filtered) - 1):
+        if (
+            filtered[i] > filtered[i - 1]
+            and filtered[i] > filtered[i + 1]
+            and filtered[i] > mean
+        ):
+            if not peaks or t[i] - peaks[-1]['t'] > 350:
+                peaks.append({'index': i, 't': t[i], 'value': filtered[i]})
+    if len(peaks) < 3:
+        return None
+    intervals = []
+    for i in range(1, len(peaks)):
+        dt = peaks[i]['t'] - peaks[i - 1]['t']
+        if 400 <= dt <= 1500:
+            intervals.append(dt)
+    if len(intervals) < 2:
+        return None
+    intervals.sort()
+    median_interval = intervals[len(intervals) // 2]
+    bpm = 60000 / median_interval
+    if bpm < 40 or bpm > 180:
+        return None
+    return bpm
+
+def update_ppg_buffer_from_payload(payload):
+    """
+    Update _ppg_buffer with last N samples from payload (step size).
+    Payload must have .quality.valid == True.
+    """
+    global _ppg_buffer
+    step_size = payload.get('step_size', _PPG_STEP_SIZE)
+    data = payload.get('data', [])
+    if not isinstance(data, list) or len(data) < step_size:
+        return
+    new_samples = data[-step_size:]
+    for sample in new_samples:
+        t = sample.get('t') or sample.get('ts') or sample.get('timestamp')
+        ir = sample.get('ir')
+        red = sample.get('red')
+        if t is not None and ir is not None and red is not None:
+            _ppg_buffer.append({'t': int(t), 'ir': int(ir), 'red': int(red)})
+    while len(_ppg_buffer) > _PPG_MAX_BUFFER:
+        _ppg_buffer.pop(0)
+
+def get_smooth_bpm_ppg(new_bpm):
+    global _bpm_smooth_ppg, _bpm_smooth_ppg_last
+    if new_bpm is None:
+        return _bpm_smooth_ppg
+    if _bpm_smooth_ppg is None:
+        _bpm_smooth_ppg = new_bpm
+    else:
+        if abs(new_bpm - _bpm_smooth_ppg) <= 20:
+            _bpm_smooth_ppg = _bpm_smooth_ppg * 0.75 + new_bpm * 0.25
+        else:
+            _bpm_smooth_ppg = _bpm_smooth_ppg * 0.90 + new_bpm * 0.10
+    _bpm_smooth_ppg_last = new_bpm
+    return _bpm_smooth_ppg
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -126,6 +214,28 @@ _latest_vitals_lock = Lock()
 # Last valid vitals preserved across packets
 _last_valid_vitals = {"heart_rate": None, "spo2": None, "temp": None}
 
+# ── Smooth BPM/SpO2 với EMA + outlier rejection ──────────────────────────────
+# State cho EMA smoothing
+_bpm_smooth = None
+_spo2_smooth = None
+_last_bpm = None
+_last_spo2 = None
+_smooth_vitals_lock = Lock()
+
+# EMA hệ số
+_BPM_EMA_ALPHA = 0.25      # BPM: 25% mới, 75% cũ (thay đổi nhanh hơn)
+_SPO2_EMA_ALPHA = 0.15     # SpO2: 15% mới, 85% cũ (thay đổi chậm hơn)
+
+# Giới hạn nhảy bất thường
+_BPM_MAX_JUMP = 25         # BPM không được nhảy quá 25 bpm giữa 2 lần đo
+_SPO2_MAX_JUMP = 4         # SpO2 không được nhảy quá 4% giữa 2 lần đo
+
+# Giới hạn phạm vi hợp lệ
+_BPM_MIN = 40
+_BPM_MAX = 180
+_SPO2_MIN = 70
+_SPO2_MAX = 100
+
 
 def _is_valid_vital_value(key: str, value):
     try:
@@ -143,6 +253,186 @@ def _is_valid_vital_value(key: str, value):
     except Exception:
         return False
     return False
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SMOOTHING & FILTERING FUNCTIONS — Làm mượt BPM/SpO2 và lọc ngoại lệ
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _smooth_bpm(new_bpm: float) -> float | None:
+    """
+    Smooth BPM using EMA (Exponential Moving Average).
+    - Reject invalid ranges: < 40 or > 180
+    - Use 0.25 weight for new value (75% old, 25% new)
+    """
+    global _bpm_smooth
+    
+    # Kiểm tra giới hạn phạm vi
+    if new_bpm < _BPM_MIN or new_bpm > _BPM_MAX:
+        print(f"⚠️  BPM out of range: {new_bpm}")
+        return _bpm_smooth
+    
+    with _smooth_vitals_lock:
+        if _bpm_smooth is None:
+            _bpm_smooth = new_bpm
+        else:
+            _bpm_smooth = _bpm_smooth * (1 - _BPM_EMA_ALPHA) + new_bpm * _BPM_EMA_ALPHA
+        
+        return round(_bpm_smooth)
+
+
+def _smooth_spo2(new_spo2: float) -> float | None:
+    """
+    Smooth SpO2 using EMA.
+    - Reject invalid ranges: < 70 or > 100
+    - Use 0.15 weight for new value (85% old, 15% new) - slower smoothing
+    """
+    global _spo2_smooth
+    
+    # Kiểm tra giới hạn phạm vi
+    if new_spo2 < _SPO2_MIN or new_spo2 > _SPO2_MAX:
+        print(f"⚠️  SpO2 out of range: {new_spo2}")
+        return _spo2_smooth
+    
+    with _smooth_vitals_lock:
+        if _spo2_smooth is None:
+            _spo2_smooth = new_spo2
+        else:
+            _spo2_smooth = _spo2_smooth * (1 - _SPO2_EMA_ALPHA) + new_spo2 * _SPO2_EMA_ALPHA
+        
+        return round(_spo2_smooth, 1)
+
+
+def _accept_bpm(new_bpm: float) -> bool:
+    """
+    Check if new BPM is acceptable (không nhảy quá 25 bpm giữa 2 lần đo).
+    """
+    global _last_bpm
+    
+    # Kiểm tra giới hạn tuyệt đối
+    if new_bpm < _BPM_MIN or new_bpm > _BPM_MAX:
+        return False
+    
+    with _smooth_vitals_lock:
+        if _last_bpm is not None:
+            jump = abs(new_bpm - _last_bpm)
+            if jump > _BPM_MAX_JUMP:
+                print(f"❌ BPM jump too large: {_last_bpm} → {new_bpm} (Δ={jump})")
+                return False
+        
+        _last_bpm = new_bpm
+        return True
+
+
+def _accept_spo2(new_spo2: float) -> bool:
+    """
+    Check if new SpO2 is acceptable (không nhảy quá 4% giữa 2 lần đo).
+    """
+    global _last_spo2
+    
+    # Kiểm tra giới hạn tuyệt đối
+    if new_spo2 < _SPO2_MIN or new_spo2 > _SPO2_MAX:
+        return False
+    
+    with _smooth_vitals_lock:
+        if _last_spo2 is not None:
+            jump = abs(new_spo2 - _last_spo2)
+            if jump > _SPO2_MAX_JUMP:
+                print(f"❌ SpO2 jump too large: {_last_spo2}% → {new_spo2}% (Δ={jump}%)")
+                return False
+        
+        _last_spo2 = new_spo2
+        return True
+
+
+def _process_vital_result(raw_bpm: float | None, raw_spo2: float | None, 
+                          quality_valid: bool = True) -> dict:
+    """
+    Process BPM/SpO2 result với đầy đủ filtering & smoothing.
+    
+    Input:
+      - raw_bpm: BPM mới từ sensor
+      - raw_spo2: SpO2 mới từ sensor
+      - quality_valid: signal quality từ payload (check valid trước khi gửi)
+    
+    Output:
+      {
+        "bpm": <smoothed & filtered BPM>,
+        "spo2": <smoothed & filtered SpO2>,
+        "status": "ok" | "bad_signal" | "outlier" | "out_of_range"
+      }
+    """
+    
+    # Bước 1: Nếu quality không tốt, giữ lại giá trị cũ
+    if not quality_valid:
+        with _smooth_vitals_lock:
+            return {
+                "bpm": _bpm_smooth,
+                "spo2": _spo2_smooth,
+                "status": "bad_signal"
+            }
+    
+    final_bpm = None
+    final_spo2 = None
+    bpm_status = "ok"
+    spo2_status = "ok"
+    
+    # Bước 2: Lọc outlier (kiểm tra nhảy bất thường)
+    if raw_bpm is not None:
+        # Check range first
+        if raw_bpm < _BPM_MIN or raw_bpm > _BPM_MAX:
+            print(f"⚠️  BPM out of range: {raw_bpm} (valid: {_BPM_MIN}-{_BPM_MAX})")
+            bpm_status = "out_of_range"
+            with _smooth_vitals_lock:
+                final_bpm = _bpm_smooth
+        elif _accept_bpm(raw_bpm):
+            final_bpm = _smooth_bpm(raw_bpm)
+            bpm_status = "ok"
+        else:
+            # Jump too large - outlier rejected, keep previous smooth value
+            bpm_status = "outlier"
+            with _smooth_vitals_lock:
+                final_bpm = _bpm_smooth
+    else:
+        with _smooth_vitals_lock:
+            final_bpm = _bpm_smooth
+    
+    if raw_spo2 is not None:
+        # Check range first
+        if raw_spo2 < _SPO2_MIN or raw_spo2 > _SPO2_MAX:
+            print(f"⚠️  SpO2 out of range: {raw_spo2}% (valid: {_SPO2_MIN}-{_SPO2_MAX}%)")
+            spo2_status = "out_of_range"
+            with _smooth_vitals_lock:
+                final_spo2 = _spo2_smooth
+        elif _accept_spo2(raw_spo2):
+            final_spo2 = _smooth_spo2(raw_spo2)
+            spo2_status = "ok"
+        else:
+            # Jump too large - outlier rejected, keep previous smooth value
+            spo2_status = "outlier"
+            with _smooth_vitals_lock:
+                final_spo2 = _spo2_smooth
+    else:
+        with _smooth_vitals_lock:
+            final_spo2 = _spo2_smooth
+    
+    # Determine overall status
+    overall_status = "ok"
+    if bpm_status != "ok" or spo2_status != "ok":
+        # Check if any was rejected as outlier
+        if bpm_status == "outlier" or spo2_status == "outlier":
+            overall_status = "outlier"
+        elif bpm_status == "out_of_range" or spo2_status == "out_of_range":
+            overall_status = "out_of_range"
+    
+    return {
+        "bpm": final_bpm,
+        "spo2": final_spo2,
+        "status": overall_status,
+        "bpm_status": bpm_status,
+        "spo2_status": spo2_status
+    }
+
 
 
 # ── Trạng thái luồng Fall_Raw ────────────────────────────────────────────────
@@ -715,6 +1005,7 @@ def _normalize_raw_payload_for_api(raw_payload):
         "sample_interval_ms": inferred_interval,
         "heart_rate": raw_payload.get("heart_rate", raw_payload.get("bpm")),
         "spo2": raw_payload.get("spo2"),
+        "quality": raw_payload.get("quality", {"valid": True, "status": "unknown"}),
         "ir": ir_series,
         "red": red_series,
         "ax": (None if not ax_series else (ax_series[0] if len(ax_series) == 1 else ax_series)),
@@ -859,95 +1150,58 @@ def on_message(client, userdata, msg):
         except json.JSONDecodeError as exc:
             raise ValueError("Payload JSON khong hop le") from exc
 
-        normalized_raw_payload = _normalize_raw_payload_for_api(raw_payload)
+        # ==== PPG BPM CALCULATION LOGIC ====
+        quality = raw_payload.get("quality", {})
+        if not (isinstance(quality, dict) and quality.get("valid", True)):
+            print(f"⚠️  Signal quality xấu: {quality.get('status', 'unknown')} - bỏ qua gói này")
+            return
 
-        _update_temperature(raw_payload.get("temp"))
+        # Lấy step_size, data
+        step_size = raw_payload.get("step_size", _PPG_STEP_SIZE)
+        data = raw_payload.get("data", [])
+        if not isinstance(data, list) or len(data) < step_size:
+            print("⚠️  Không đủ data hoặc step_size trong payload")
+            return
 
-        health_samples = from_json_samples(json.dumps(normalized_raw_payload))
-
-        latest_health_packet = None
-        for health_data in health_samples:
-            with _latest_vitals_lock:
-                hr_for_status = (
-                    health_data.heart_rate
-                    if _is_valid_vital_value("heart_rate", health_data.heart_rate)
-                    else _last_valid_vitals.get("heart_rate")
-                )
-                temp_for_status = (
-                    health_data.temp
-                    if _is_valid_vital_value("temp", health_data.temp)
-                    else _last_valid_vitals.get("temp")
-                )
-
-            status = classify(hr_for_status, temp_for_status, health_data.spo2)
-
-            # Build health packet (vitals only, không có fall)
-            packet = _build_health_packet(health_data, msg.topic)
-            packet["data"]["status"] = status
-            latest_health_packet = packet
-
-            with _latest_vitals_lock:
-                if _is_valid_vital_value("heart_rate", health_data.heart_rate):
-                    _last_valid_vitals["heart_rate"] = float(health_data.heart_rate)
-                if _is_valid_vital_value("spo2", health_data.spo2):
-                    _last_valid_vitals["spo2"] = float(health_data.spo2)
-                if _is_valid_vital_value("temp", health_data.temp):
-                    _last_valid_vitals["temp"] = float(health_data.temp)
-
-        _handle_alert_over_3_batches(health_samples)
-
-        if latest_health_packet is not None:
-            with _packet_lock:
-                # Giữ lại BPM hợp lệ nếu batch mới báo 0/None
-                try:
-                    bpm_val = latest_health_packet.get("data", {}).get("bpm")
-                except Exception:
-                    bpm_val = None
-
-                if bpm_val is None or bpm_val == 0:
-                    if _latest_hr is not None and _latest_hr > 0:
-                        latest_health_packet["data"]["bpm"] = _latest_hr
-                        bpm_val = _latest_hr
-
-                if bpm_val is not None:
-                    try:
-                        _latest_hr = float(bpm_val)
-                    except Exception:
-                        pass
-
-                try:
-                    spo2_val = latest_health_packet.get("data", {}).get("spo2")
-                except Exception:
-                    spo2_val = None
-
-                if spo2_val is None:
-                    if _latest_spo2 is not None and _latest_spo2 > 0:
-                        latest_health_packet["data"]["spo2"] = _latest_spo2
-                        spo2_val = _latest_spo2
-
-                if spo2_val is not None:
-                    try:
-                        _latest_spo2 = float(spo2_val)
-                    except Exception:
-                        pass
-
-                _latest_health_packet = latest_health_packet
-                _latest_raw_payload = normalized_raw_payload
-
-            with _fall_raw_state_lock:
-                waiting_for_fall_raw = _waiting_for_fall_raw
-
-            if waiting_for_fall_raw:
-                print("⏳ [LUỒNG 1] Dang cho fall_raw, tam ngung emit health_update")
+        # Đẩy 50 mẫu cuối vào buffer
+        with _ppg_lock:
+            update_ppg_buffer_from_payload({"data": data, "step_size": step_size})
+            buffer_len = len(_ppg_buffer)
+            # Khi đủ buffer, tính BPM
+            bpm_ppg = None
+            if buffer_len >= _PPG_MIN_CALC:
+                calc_window = _ppg_buffer[-200:]
+                bpm_ppg = calculate_bpm_from_buffer(calc_window)
+                if bpm_ppg is not None:
+                    bpm_ppg_smooth = get_smooth_bpm_ppg(bpm_ppg)
+                    print(f"✅ [PPG] BPM raw: {bpm_ppg:.1f}, BPM smooth: {bpm_ppg_smooth:.1f} (buffer={buffer_len})")
+                else:
+                    bpm_ppg_smooth = None
+                    print(f"⚠️  [PPG] Không đủ peak hợp lệ để tính BPM (buffer={buffer_len})")
             else:
-                _append_history(latest_health_packet)
-                _emit_health(latest_health_packet, delay_ms=WS_HEALTH_EMIT_DELAY_MS)
+                bpm_ppg_smooth = None
+                print(f"⏳ [PPG] Chưa đủ mẫu để tính BPM (buffer={buffer_len})")
 
-                print(
-                    f"💓 [HEALTH_UPDATE] BPM={latest_health_packet['data']['bpm']} "
-                    f"SpO2={latest_health_packet['data']['spo2']}% "
-                    f"Temp={latest_health_packet['data']['temp']}°C"
-                )
+        # Tiếp tục xử lý các chỉ số khác như temp, spo2...
+        # Tạo health packet
+        temp = raw_payload.get("temp")
+        spo2 = raw_payload.get("spo2")
+        ts = raw_payload.get("ts") or (data[-1]["t"] if data else None)
+        packet = {
+            "type": "health_update",
+            "source_topic": msg.topic,
+            "server_timestamp": int(time.time()),
+            "data": {
+                "ts": ts,
+                "bpm": round(bpm_ppg_smooth, 1) if bpm_ppg_smooth is not None else None,
+                "spo2": spo2,
+                "temp": temp,
+                "status": "NORMAL" if bpm_ppg_smooth is not None else "WAITING"
+            }
+        }
+        _append_history(packet)
+        _emit_health(packet, delay_ms=WS_HEALTH_EMIT_DELAY_MS)
+        print(f"💓 [HEALTH_UPDATE] BPM={packet['data']['bpm']} SpO2={packet['data']['spo2']} Temp={packet['data']['temp']}")
 
     except ValueError as exc:
         print("❌ Payload khong hop le:", exc)

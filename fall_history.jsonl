@@ -1,1 +1,5 @@
 {"saved_at": 1778656192, "type": "fall_update", "source_topic": "sensor/fall_raw", "server_timestamp": 1778656192, "fall": {"detected": true, "confidence": 0.649}}
+{"saved_at": 1778660400, "type": "fall_update", "source_topic": "sensor/fall_raw", "server_timestamp": 1778660400, "fall": {"detected": true, "confidence": 0.996}}
+{"saved_at": 1778660453, "type": "fall_update", "source_topic": "sensor/fall_raw", "server_timestamp": 1778660453, "fall": {"detected": false, "confidence": 0.454}}
+{"saved_at": 1778660715, "type": "fall_update", "source_topic": "sensor/fall_raw", "server_timestamp": 1778660715, "fall": {"detected": false, "confidence": 0.534}}
+{"saved_at": 1778663779, "type": "fall_update", "source_topic": "sensor/fall_raw", "server_timestamp": 1778663779, "fall": {"detected": false, "confidence": 0.228}}
