@@ -73,3 +73,5 @@
 {"saved_at": 1778656612, "type": "health_update", "source_topic": "sensor/data", "server_timestamp": 1778656612, "data": {"ts": 234843, "bpm": 75, "spo2": 94.2, "temp": 33.39, "status": ["NORMAL"]}}
 {"saved_at": 1778656629, "type": "health_update", "source_topic": "sensor/data", "server_timestamp": 1778656629, "data": {"ts": 251254, "bpm": 68, "spo2": 95.9, "temp": 33.42, "status": ["NORMAL"]}}
 {"saved_at": 1778656645, "type": "health_update", "source_topic": "sensor/data", "server_timestamp": 1778656645, "data": {"ts": 267623, "bpm": 125, "spo2": 93.9, "temp": 33.46, "status": ["HIGH_HEART_RATE"]}}
+{"saved_at": 1778656662, "type": "health_update", "source_topic": "sensor/data", "server_timestamp": 1778656662, "data": {"ts": 283993, "bpm": 125.0, "spo2": 95.0, "temp": 33.48, "status": ["HIGH_HEART_RATE"]}}
+{"saved_at": 1778656678, "type": "health_update", "source_topic": "sensor/data", "server_timestamp": 1778656678, "data": {"ts": 300284, "bpm": 107, "spo2": 93.4, "temp": 33.52, "status": ["NORMAL"]}}
