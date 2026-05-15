@@ -269,7 +269,6 @@ def _smooth_bpm(new_bpm: float) -> float | None:
     
     # Kiểm tra giới hạn phạm vi
     if new_bpm < _BPM_MIN or new_bpm > _BPM_MAX:
-        print(f"⚠️  BPM out of range: {new_bpm}")
         return _bpm_smooth
     
     with _smooth_vitals_lock:
@@ -291,7 +290,6 @@ def _smooth_spo2(new_spo2: float) -> float | None:
     
     # Kiểm tra giới hạn phạm vi
     if new_spo2 < _SPO2_MIN or new_spo2 > _SPO2_MAX:
-        print(f"⚠️  SpO2 out of range: {new_spo2}")
         return _spo2_smooth
     
     with _smooth_vitals_lock:
@@ -381,7 +379,6 @@ def _process_vital_result(raw_bpm: float | None, raw_spo2: float | None,
     if raw_bpm is not None:
         # Check range first
         if raw_bpm < _BPM_MIN or raw_bpm > _BPM_MAX:
-            print(f"⚠️  BPM out of range: {raw_bpm} (valid: {_BPM_MIN}-{_BPM_MAX})")
             bpm_status = "out_of_range"
             with _smooth_vitals_lock:
                 final_bpm = _bpm_smooth
@@ -400,7 +397,6 @@ def _process_vital_result(raw_bpm: float | None, raw_spo2: float | None,
     if raw_spo2 is not None:
         # Check range first
         if raw_spo2 < _SPO2_MIN or raw_spo2 > _SPO2_MAX:
-            print(f"⚠️  SpO2 out of range: {raw_spo2}% (valid: {_SPO2_MIN}-{_SPO2_MAX}%)")
             spo2_status = "out_of_range"
             with _smooth_vitals_lock:
                 final_spo2 = _spo2_smooth
@@ -1182,18 +1178,21 @@ def on_message(client, userdata, msg):
                 bpm_ppg = calculate_bpm_from_buffer(calc_window)
                 if bpm_ppg is not None:
                     bpm_ppg_smooth = get_smooth_bpm_ppg(bpm_ppg)
-                    print(f"✅ [PPG] BPM raw: {bpm_ppg:.1f}, BPM smooth: {bpm_ppg_smooth:.1f} (buffer={buffer_len})")
                 else:
                     bpm_ppg_smooth = None
-                    print(f"⚠️  [PPG] Không đủ peak hợp lệ để tính BPM (buffer={buffer_len})")
             else:
                 bpm_ppg_smooth = None
-                print(f"⏳ [PPG] Chưa đủ mẫu để tính BPM (buffer={buffer_len})")
 
-        # Tiếp tục xử lý các chỉ số khác như temp, spo2...
-        # Tạo health packet
         temp = raw_payload.get("temp")
-        spo2 = raw_payload.get("spo2")
+        # Luôn tính SpO2 từ IR/RED data thay vì đọc từ payload
+        spo2 = None
+        try:
+            normalized_ppg = _normalize_raw_payload_for_api(raw_payload)
+            samples = from_json_samples(json.dumps(normalized_ppg))
+            if samples:
+                spo2 = samples[-1].spo2
+        except Exception as exc:
+            pass
         ts = raw_payload.get("ts") or (data[-1]["t"] if data else None)
         packet = {
             "type": "health_update",

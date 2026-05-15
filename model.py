@@ -115,10 +115,8 @@ def _to_optional_int_list(value: Any, field_name: str, expected_len: int) -> Lis
     # Nếu độ dài không khớp, cắt hoặc pad với 0
     if len(value) != expected_len:
         if len(value) > expected_len:
-            print(f"⚠️  Truong '{field_name}' co {len(value)} phan tu, cat ve {expected_len}")
             value = value[:expected_len]
         else:
-            print(f"⚠️  Truong '{field_name}' co {len(value)} phan tu, pad them {expected_len - len(value)} gia tri 0")
             value = value + [0] * (expected_len - len(value))
 
     return [_to_int(item, field_name) for item in value]
@@ -177,9 +175,8 @@ def _infer_sample_interval_ms(
 def _sanitize_optical_series(values: List[int]) -> List[int]:
     if not values:
         return values
-    # Keep series as-is; do not forward-fill missing/zero values here.
-    # Upstream logic will treat values <= 0 as invalid and handle segments.
-    return list(values)
+    # Drop invalid placeholders early to stabilize peak/AC calculations.
+    return [int(v) if v is not None and int(v) > 0 else 0 for v in values]
 
 
 def _split_contiguous_valid_segments(values: List[int] | None, min_valid_value: int = 1) -> list:
@@ -260,11 +257,10 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
     mean_signal = float(np.mean(np.abs(signal)))
     rel_std = signal_std / mean_signal if mean_signal > 0 else 0.0
     if mean_signal <= 1e-6 or rel_std < 1e-4:
-        print(f"⚠️  IR segment too low variation: std={signal_std:.2f}, mean={mean_signal:.2f}")
         return None
 
     sample_rate_hz = _sample_rate_hz(sample_interval_ms)
-    dc_window = max(2, int(sample_rate_hz * 1.0))
+    dc_window = max(2, int(sample_rate_hz * 0.5))
     centered = _remove_dc(signal, dc_window)
     filtered = _bandpass_fft(centered, sample_rate_hz, 0.5, 4.0)
 
@@ -274,7 +270,7 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
         return None
 
     normalized = filtered / filtered_std
-    threshold = max(0.4, 0.5 * float(np.std(normalized)))
+    threshold = max(0.8, 1.2 * float(np.std(normalized)))
     min_gap = max(1, int(sample_rate_hz * 0.40))
 
     peaks: List[int] = []
@@ -291,13 +287,13 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
             peaks[-1] = idx
 
     if len(peaks) < 2:
-        print(f"⚠️  Not enough peaks in IR segment (found {len(peaks)})")
         return None
 
     rr_seconds = np.diff(peaks) / sample_rate_hz
-    rr_seconds = rr_seconds[(rr_seconds > 0.25) & (rr_seconds < 2.0)]
+    min_rr = 60.0 / MAX_BPM
+    max_rr = 60.0 / MIN_BPM
+    rr_seconds = rr_seconds[(rr_seconds > min_rr) & (rr_seconds < max_rr)]
     if rr_seconds.size == 0:
-        print(f"⚠️  Peak intervals invalid, cannot compute BPM")
         return None
 
     bpm = 60.0 / float(np.median(rr_seconds))
@@ -333,25 +329,25 @@ def _estimate_spo2_from_ir_red(
             # overlap region
             overlap_start = max(i_start, r_start)
             overlap_end = min(i_end, r_end)
-            if overlap_end - overlap_start + 1 >= 20:
-                length = overlap_end - overlap_start + 1
-                if length > best_len:
+            overlap_len = overlap_end - overlap_start + 1
+            if overlap_len >= 20:
+                if overlap_len > best_len:
                     # extract overlapping slices
                     ir_slice = [int(v) for v in ir_values[overlap_start:overlap_end+1]]
                     red_slice = [int(v) for v in red_values[overlap_start:overlap_end+1]]
                     best_segment = (overlap_start, ir_slice, red_slice)
-                    best_len = length
-
+                    best_len = overlap_len
+    
     if best_segment is None:
         return None
 
-    _, ir_slice, red_slice = best_segment
+    overlap_start, ir_slice, red_slice = best_segment
 
     ir = np.array(ir_slice, dtype=np.float64)
     red = np.array(red_slice, dtype=np.float64)
 
     sample_rate_hz = _sample_rate_hz(sample_interval_ms)
-    dc_window = max(2, int(sample_rate_hz * 1.0))
+    dc_window = max(2, int(sample_rate_hz * 0.5))
 
     ir_dc = float(np.mean(ir))
     red_dc = float(np.mean(red))
@@ -425,31 +421,26 @@ def _build_health_data_sample(
 
 # ─── Temperature filtering ──────────────────────────────────────────────────
 # Median filter: T = median(T_{i-2}, T_{i-1}, T_i)
-# EMA (Exponential Moving Average): T_smooth = 0.3T + 0.7T_old
+# EMA (Exponential Moving Average): T_smooth = 0.5T + 0.5T_old
 
 _last_temperature = 36.5
 _temperature_lock = None  # Will be set by app.py if needed
 
 def _median_filter_temperature(temps: List[float]) -> float:
-    """
-    Median filter: T = median(T_{i-2}, T_{i-1}, T_i)
     
-    Input: List of temperatures (up to 3 values)
-    Output: Median value (smoothed)
-    """
     if not temps:
         return 36.5
     return float(np.median(np.array(temps, dtype=np.float64)))
 
 
-def _ema_smooth_temperature(temp_new: float, temp_old: float = None, alpha: float = 0.3) -> float:
+def _ema_smooth_temperature(temp_new: float, temp_old: float = None, alpha: float = 0.5) -> float:
     """
     EMA (Exponential Moving Average): T_smooth = α×T_new + (1-α)×T_old
     
     Args:
         temp_new: Mẫu nhiệt độ mới từ MAX30205
         temp_old: Giá trị EMA trước đó (default: từ _last_temperature)
-        alpha: Smooth factor (default: 0.3)
+        alpha: Smooth factor (default: 0.5)
     
     Returns:
         Giá trị nhiệt độ đã làm mượt
@@ -482,10 +473,8 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
             # Nếu độ dài không khớp, cắt hoặc pad
             if len(values) != sample_count:
                 if len(values) > sample_count:
-                    print(f"⚠️  Truong '{key}' co {len(values)} phan tu, cat ve {sample_count}")
                     values = values[:sample_count]
                 else:
-                    print(f"⚠️  Truong '{key}' co {len(values)} phan tu, pad them {sample_count - len(values)} gia tri 0.0")
                     values = values + [0.0] * (sample_count - len(values))
             series_map[key] = values
         else:
