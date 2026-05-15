@@ -1,0 +1,12 @@
+{
+  "threshold": 0.5861788339783659,
+  "roc_auc": 0.9589514751708135,
+  "average_precision": 0.9335490618110852,
+  "n_train": 104537,
+  "n_val": 21837,
+  "n_test": 23177,
+  "n_features": 103,
+  "window_size": 150,
+  "stride": 50,
+  "target_hz": 100
+}

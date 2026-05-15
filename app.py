@@ -87,9 +87,9 @@ def _resolve_api_port() -> int:
 
 API_PORT = _resolve_api_port()
 SENSOR_INPUT_PROCESS_DELAY_MS = max(0, int(os.getenv("SENSOR_INPUT_PROCESS_DELAY_MS", "0")))
-WS_HEALTH_EMIT_DELAY_MS = max(0, int(os.getenv("WS_HEALTH_EMIT_DELAY_MS", "120")))
+WS_HEALTH_EMIT_DELAY_MS = max(0, int(os.getenv("WS_HEALTH_EMIT_DELAY_MS", "0")))
 WS_FALL_EMIT_DELAY_MS = max(0, int(os.getenv("WS_FALL_EMIT_DELAY_MS", "0")))
-FALL_MODEL_BLOCK_MS = max(0, int(os.getenv("FALL_MODEL_BLOCK_MS", "1000")))
+FALL_MODEL_BLOCK_MS = max(0, int(os.getenv("FALL_MODEL_BLOCK_MS", "0")))
 BUZZER_BEEP_ON_MS = max(0, int(os.getenv("BUZZER_BEEP_ON_MS", "2000")))
 BUZZER_BEEP_OFF_MS = max(0, int(os.getenv("BUZZER_BEEP_OFF_MS", "1000")))
 BUZZER_BEEP_COUNT = max(1, int(os.getenv("BUZZER_BEEP_COUNT", "2")))
@@ -566,7 +566,8 @@ def _get_fall_model():
         with _fall_model_lock:
             if _fall_model is None:
                 _fall_model = create_fall_model()
-                print("🤖 Fall model da nap: AI(model.h5)")
+                model_name = getattr(_fall_model, "model_name", "unknown")
+                print(f"🤖 Fall model da nap: {model_name}")
     return _fall_model
 
 
@@ -823,14 +824,34 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
         trigger_ts = decoded_data['trigger_ts']
         pre_samples = decoded_data['pre_samples']
 
-        if samples_array.shape[0] < model._required_window:
-            print(f"⏳ fall_raw chua du: {samples_array.shape[0]}/{model._required_window} samples")
-            return None
-        if samples_array.shape[0] > model._required_window:
-            samples_array = samples_array[:model._required_window]
+        raw6 = np.asarray(samples_array, dtype=np.float32)[:, :6]
+        window_size = int(getattr(model, "window_size", raw6.shape[0]) or raw6.shape[0])
 
-        motion_buf = samples_array
-        print(f"✅ fall_raw du: {motion_buf.shape[0]}/{model._required_window} samples → Chay model")
+        if raw6.shape[0] < window_size:
+            print(f"⏳ fall_raw chua du: {raw6.shape[0]}/{window_size} samples")
+            return None
+
+        def _select_window(raw6_window: np.ndarray, center_idx, size: int) -> np.ndarray:
+            if raw6_window.shape[0] <= size:
+                return raw6_window
+
+            try:
+                center = int(center_idx)
+            except (TypeError, ValueError):
+                center = None
+
+            if center is None or center < 0 or center >= raw6_window.shape[0]:
+                return raw6_window[:size]
+
+            start = max(0, center - size // 2)
+            end = start + size
+            if end > raw6_window.shape[0]:
+                end = raw6_window.shape[0]
+                start = end - size
+            return raw6_window[start:end]
+
+        raw6_window = _select_window(raw6, pre_samples, window_size)
+        print(f"✅ fall_raw du: {raw6_window.shape[0]}/{window_size} samples → Chay model")
 
         with _latest_vitals_lock:
             hr = _latest_hr
@@ -839,30 +860,17 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
         temp = _get_current_temperature()
         print(f"💚 Latest vitals từ sensor/data: HR={hr} BPM, SpO2={spo2:.1f}%, Temp={temp:.1f}°C")
 
-        features_array = np.zeros((motion_buf.shape[0], 11), dtype=np.float32)
+        prediction = model.predict_raw_window(
+            raw6_window,
+            vitals={"heart_rate": hr, "spo2": spo2, "temp": temp},
+        )
 
-        for i in range(motion_buf.shape[0]):
-            ax, ay, az = motion_buf[i, 0], motion_buf[i, 1], motion_buf[i, 2]
-            gx, gy, gz = motion_buf[i, 3], motion_buf[i, 4], motion_buf[i, 5]
-
-            roll = np.arctan2(ay, az + 1e-6)
-            pitch = np.arctan2(-ax, np.sqrt(ay**2 + az**2) + 1e-6)
-
-            features_array[i] = [ax, ay, az, gx, gy, gz, roll, pitch, hr, spo2, temp]
-
-        mean = model._mean
-        std = model._std
-        normalized = (features_array - mean) / (std + 1e-6)
-
-        X = normalized[np.newaxis, ...]
-
-        pred = model._model.predict(X, verbose=0)
-        confidence = float(pred[0][0])
-
-        threshold = float(os.getenv("AI_FALL_THRESHOLD", "0.6"))
-        detected = confidence >= threshold
-
-        print(f"🧠 [MODEL] Features=11 (150 motion) | Inference: confidence={confidence:.3f}, threshold={threshold} → detected={detected}")
+        confidence = float(prediction.confidence)
+        detected = bool(prediction.fall_detected)
+        model_name = getattr(model, "model_name", "unknown")
+        print(
+            f"🧠 [MODEL:{model_name}] Inference: confidence={confidence:.3f} → detected={detected}"
+        )
 
         alert_trigger = "fall_raw"
         if alert_data:
