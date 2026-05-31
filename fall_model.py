@@ -292,3 +292,116 @@ def create_fall_model() -> BaseFallModel:
     print(f"✅ Loaded GBDT Fall Model from {GBDT_MODEL_PATH}")
 
     return model
+
+
+# ─── Fallback Detection Methods (feature/add-fallback-detection) ──────────────
+#
+# def detect_fall_by_acceleration_threshold(ax: float, ay: float, az: float, 
+#                                           threshold_g: float = 2.5) -> bool:
+#     """
+#     Simple fallback fall detection using acceleration magnitude threshold.
+#     
+#     Detects sudden vertical drops by checking total acceleration magnitude
+#     against threshold. Useful when ML model is unavailable.
+#     
+#     Physics:
+#     - During fall: acceleration magnitude spikes (free fall + impact)
+#     - threshold_g: acceleration threshold in g-forces (default 2.5g)
+#     
+#     Args:
+#         ax, ay, az: Accelerometer readings (m/s²)
+#         threshold_g: Detection threshold in g-forces
+#         
+#     Returns:
+#         True if acceleration exceeds threshold (likely fall)
+#     """
+#     g_force = 9.81  # m/s²
+#     acc_magnitude = np.sqrt(ax**2 + ay**2 + az**2)
+#     threshold_ms2 = threshold_g * g_force
+#     return acc_magnitude > threshold_ms2
+
+
+# def detect_fall_by_gyro_spike(gx: float, gy: float, gz: float,
+#                                threshold_dps: float = 500) -> bool:
+#     """
+#     Detect fall using gyroscope angular velocity spike.
+#     
+#     During a fall, body rotates rapidly. Large gyroscope spikes
+#     indicate sudden rotational movement typical of falls.
+#     
+#     Args:
+#         gx, gy, gz: Gyroscope readings (deg/s)
+#         threshold_dps: Angular velocity threshold in deg/s
+#         
+#     Returns:
+#         True if any axis exceeds threshold
+#     """
+#     gyro_magnitude = np.sqrt(gx**2 + gy**2 + gz**2)
+#     return gyro_magnitude > threshold_dps
+
+
+# def ensemble_fall_detection(raw_imu: Dict[str, Any], 
+#                             ml_model_available: bool,
+#                             ml_confidence: float = 0.0) -> Dict[str, Any]:
+#     """
+#     Ensemble fall detection combining ML model + simple heuristics.
+#     
+#     Decision logic:
+#     - If ML model available and confident (>0.75): trust ML
+#     - If acceleration threshold exceeded: flag as potential fall
+#     - If gyro spike + low heart rate: flag as fall
+#     - Combine signals for robust detection
+#     
+#     Args:
+#         raw_imu: IMU data dictionary with ax,ay,az,gx,gy,gz,heart_rate
+#         ml_model_available: Whether ML model is ready
+#         ml_confidence: ML model confidence score (0-1)
+#         
+#     Returns:
+#         Dictionary with:
+#         - fall_detected: bool
+#         - confidence: float (0-1)
+#         - method: str (ml|accel|gyro|ensemble)
+#         - reasons: List[str]
+#     """
+#     result = {
+#         "fall_detected": False,
+#         "confidence": 0.0,
+#         "method": "none",
+#         "reasons": []
+#     }
+#     
+#     if not raw_imu:
+#         return result
+#     
+#     # Try ML model first if available
+#     if ml_model_available and ml_confidence > 0.75:
+#         result["fall_detected"] = True
+#         result["confidence"] = ml_confidence
+#         result["method"] = "ml"
+#         result["reasons"].append(f"ML model confidence: {ml_confidence:.2%}")
+#         return result
+#     
+#     # Fallback to heuristics
+#     accel_spike = detect_fall_by_acceleration_threshold(
+#         raw_imu.get("ax", 0), raw_imu.get("ay", 0), raw_imu.get("az", 0)
+#     )
+#     gyro_spike = detect_fall_by_gyro_spike(
+#         raw_imu.get("gx", 0), raw_imu.get("gy", 0), raw_imu.get("gz", 0)
+#     )
+#     
+#     if accel_spike and gyro_spike:
+#         result["fall_detected"] = True
+#         result["confidence"] = 0.85
+#         result["method"] = "ensemble"
+#         result["reasons"].extend([
+#             "High acceleration magnitude",
+#             "High angular velocity"
+#         ])
+#     elif accel_spike:
+#         result["fall_detected"] = True
+#         result["confidence"] = 0.70
+#         result["method"] = "accel"
+#         result["reasons"].append("Acceleration threshold exceeded")
+#     
+#     return result
