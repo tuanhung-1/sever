@@ -569,9 +569,14 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
         raw6 = np.asarray(samples_array, dtype=np.float32)[:, :6]
         window_size = int(getattr(model, "window_size", raw6.shape[0]) or raw6.shape[0])
 
-        if raw6.shape[0] < window_size:
-            print(f"⏳ fall_raw chua du: {raw6.shape[0]}/{window_size} samples")
+        if raw6.shape[0] == 0:
+            print("fall_raw khong co sample")
             return None
+        if raw6.shape[0] < window_size:
+            print(
+                f"fall_raw ngan hon window model: {raw6.shape[0]}/{window_size} samples, "
+                "model se pad window"
+            )
 
         def _select_window(raw6_window: np.ndarray, center_idx, size: int) -> np.ndarray:
             if raw6_window.shape[0] <= size:

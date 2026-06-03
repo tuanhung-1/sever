@@ -39,6 +39,16 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _resolve_api_port() -> int:
     raw_port = os.getenv("API_PORT") or os.getenv("PORT") or "5050"
     try:
@@ -63,7 +73,7 @@ class Settings:
     fall_history_file: str
     fall_model_dir: str
     fall_model_file: str
-    fall_model_threshold: float
+    fall_model_threshold: float | None
     alert_cooldown_s: int
     alert_bpm_low: int
     alert_bpm_high: int
@@ -114,7 +124,7 @@ settings = Settings(
         "artifacts/fall_detection/multistage",
     ),
     fall_model_file=os.getenv("FALL_MODEL_FILE", "fall_cnn_gated_nolambda.keras"),
-    fall_model_threshold=_env_float("FALL_MODEL_THRESHOLD", 0.9),
+    fall_model_threshold=_env_optional_float("FALL_MODEL_THRESHOLD"),
     alert_cooldown_s=max(0, _env_int("ALERT_COOLDOWN_S", 20)),
     alert_bpm_low=_env_int("ALERT_BPM_LOW", 50),
     alert_bpm_high=_env_int("ALERT_BPM_HIGH", 120),

@@ -24,6 +24,14 @@ Fall detection uses the trained multi-stage gated 1D CNN artifacts in:
 - `artifacts/fall_detection/multistage/fall_cnn_mean.npy`
 - `artifacts/fall_detection/multistage/fall_cnn_std.npy`
 
+Current model metadata:
+
+- Window size: `320`
+- Target rate: `100 Hz`
+- Features: `ax, ay, az, gx, gy, gz, acc_mag, gyro_mag`
+- Threshold: `0.87`
+- Post-filter: `soft_peak_filter`
+
 ## Socket.IO
 
 Frontend should subscribe to:
