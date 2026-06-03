@@ -9,6 +9,12 @@ __pycache__/
 .venv/
 venv/
 
+# Local configuration
+.env
+
+# Runtime data
+storage/
+
 # OS
 .DS_Store
 

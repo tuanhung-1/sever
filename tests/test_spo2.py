@@ -6,9 +6,15 @@ Test script để tính SpO2 từ PPG window payload.
 import json
 import sys
 import time
-from model import from_json_samples
+from pathlib import Path
 
-# Helper function (from app.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.models.health import from_json_samples
+
+# Helper function mirroring app payload normalization.
 def _to_non_negative_number(value):
     try:
         v = float(value)
@@ -18,7 +24,7 @@ def _to_non_negative_number(value):
 
 
 def normalize_raw_payload_for_api(raw_payload):
-    """Extract IR/RED from data array and normalize payload (from app.py logic)."""
+    """Extract IR/RED from data array and normalize payload."""
     if not isinstance(raw_payload, dict):
         raise ValueError("Payload khong hop le, can doi tuong JSON")
 

@@ -1,9 +1,10 @@
-from numpy.random import sample
-import paho.mqtt.client as mqtt
+try:
+    import paho.mqtt.client as mqtt
+except ModuleNotFoundError:
+    mqtt = None
 import ssl
 import certifi
 import time
-import os
 import json
 import traceback
 import struct
@@ -13,10 +14,12 @@ from collections import deque
 import numpy as np
 
 from flask import Flask, jsonify, request
-from flask_socketio import SocketIO
 
-from fall_model import create_fall_model
-from model import from_json_samples, classify, STATUS_FALL_DETECTED
+from app.core.config import settings
+from app.core.extensions import socketio
+from app.models.fall import create_fall_model
+from app.models.health import from_json_samples, classify, STATUS_FALL_DETECTED
+from app.repositories.history_repository import append_jsonl_record, read_jsonl_records
 
 _buzzer_active = False
 _wait_next_normal_batch = False
@@ -26,76 +29,41 @@ _vital_batch_buffer = deque(maxlen=3)
 
 # Cooldown tránh spam
 _last_alert_time = 0
-ALERT_COOLDOWN_S = 20
+ALERT_COOLDOWN_S = settings.alert_cooldown_s
 
 _batch_alert_lock = Lock()
 
 
-VITAL_THRESHOLDS = {
-    "bpm": {
-        "low":  int(os.getenv("ALERT_BPM_LOW",  "50")),   # < 50 → bradycardia
-        "high": int(os.getenv("ALERT_BPM_HIGH", "120")),  # > 120 → tachycardia
-    },
-    "spo2": {
-        "low":  float(os.getenv("ALERT_SPO2_LOW",  "93.0")),  # < 93 → nguy hiểm
-        "high": float(os.getenv("ALERT_SPO2_HIGH", "100.1")), # SpO2 không có high thực tế
-    },
-    "temp": {
-        "low":  float(os.getenv("ALERT_TEMP_LOW",  "32.5")),  # < 32.5 → hạ thân nhiệt
-        "high": float(os.getenv("ALERT_TEMP_HIGH", "39.5")),  # > 39.5 → sốt
-    },
-}
+VITAL_THRESHOLDS = settings.vital_thresholds
  
 # Tần số beep: ON ms, OFF ms, số lần lặp trong 60 giây
-ALERT_BEEP_ON_MS    = max(100, int(os.getenv("ALERT_BEEP_ON_MS",   "500")))
-ALERT_BEEP_OFF_MS   = max(100, int(os.getenv("ALERT_BEEP_OFF_MS",  "700")))
-ALERT_BEEP_DURATION_S = max(10, int(os.getenv("ALERT_BEEP_DURATION_S", "60")))
- 
-# State machine: theo dõi trạng thái trước của từng vital
-# Giá trị: True = đang abnormal, False = đang normal
-_vital_prev_abnormal: dict[str, bool] = {
-    "bpm":  False,
-    "spo2": False,
-    "temp": False,
-}
-_alert_state_lock = Lock()
+ALERT_BEEP_ON_MS = settings.alert_beep_on_ms
+ALERT_BEEP_OFF_MS = settings.alert_beep_off_ms
+ALERT_BEEP_DURATION_S = settings.alert_beep_duration_s
  
 # Danh sách timer đang chạy (để cancel khi có alert mới)
 _alert_timers: list[Timer] = []
 _alert_timers_lock = Lock()
 
-BROKER = "11060dbd13b54fc988ae8f9bfc43c089.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-USERNAME = "heart-rate"
-PASSWORD = "aB123456"
-CLIENT_ID = "python_backend1dsdssdaassdsasdd"
-MQTT_REQUIRED = os.getenv("MQTT_REQUIRED", "false").lower() == "true"
-API_BIND_HOST = os.getenv("API_BIND_HOST", "0.0.0.0")
-API_ACCESS_HOST = os.getenv("API_ACCESS_HOST", "192.168.1.23")
-HISTORY_FILE        = os.getenv("HISTORY_FILE",      "health_history.jsonl")
-FALL_HISTORY_FILE   = os.getenv("FALL_HISTORY_FILE", "fall_history.jsonl")
-USE_AI_FALL_MODEL = os.getenv("USE_AI_FALL_MODEL", "true").lower() == "true"
-API_VERBOSE_OUTPUT = os.getenv("API_VERBOSE_OUTPUT", "false").lower() == "true"
+BROKER = settings.mqtt_broker
+MQTT_PORT = settings.mqtt_port
+USERNAME = settings.mqtt_username
+PASSWORD = settings.mqtt_password
+CLIENT_ID = settings.mqtt_client_id
+MQTT_REQUIRED = settings.mqtt_required
+API_BIND_HOST = settings.api_bind_host
+API_ACCESS_HOST = settings.api_access_host
+HISTORY_FILE = settings.history_file
+FALL_HISTORY_FILE = settings.fall_history_file
+API_VERBOSE_OUTPUT = settings.api_verbose_output
 
 
-def _resolve_api_port() -> int:
-    raw_port = os.getenv("API_PORT") or os.getenv("PORT") or "5050"
-    try:
-        return int(raw_port)
-    except ValueError:
-        return 5050
-
-
-API_PORT = _resolve_api_port()
-SENSOR_INPUT_PROCESS_DELAY_MS = max(0, int(os.getenv("SENSOR_INPUT_PROCESS_DELAY_MS", "0")))
-WS_HEALTH_EMIT_DELAY_MS = max(0, int(os.getenv("WS_HEALTH_EMIT_DELAY_MS", "0")))
-WS_FALL_EMIT_DELAY_MS = max(0, int(os.getenv("WS_FALL_EMIT_DELAY_MS", "0")))
-FALL_MODEL_BLOCK_MS = max(0, int(os.getenv("FALL_MODEL_BLOCK_MS", "0")))
-BUZZER_BEEP_ON_MS = max(0, int(os.getenv("BUZZER_BEEP_ON_MS", "2000")))
-BUZZER_BEEP_OFF_MS = max(0, int(os.getenv("BUZZER_BEEP_OFF_MS", "1000")))
-BUZZER_BEEP_COUNT = max(1, int(os.getenv("BUZZER_BEEP_COUNT", "2")))
-BUZZER_TOTAL_MS = max(0, int(os.getenv("BUZZER_TOTAL_MS", "60000")))
-_PPG_STEP_SIZE = int(os.getenv("PPG_STEP_SIZE", "80"))
+API_PORT = settings.api_port
+SENSOR_INPUT_PROCESS_DELAY_MS = settings.sensor_input_process_delay_ms
+WS_HEALTH_EMIT_DELAY_MS = settings.ws_health_emit_delay_ms
+WS_FALL_EMIT_DELAY_MS = settings.ws_fall_emit_delay_ms
+FALL_MODEL_BLOCK_MS = settings.fall_model_block_ms
+_PPG_STEP_SIZE = settings.ppg_step_size
 
 
 def moving_average(arr, window_size):
@@ -164,7 +132,11 @@ def calculate_bpm_from_samples(samples):
 
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio.init_app(app, cors_allowed_origins="*")
+
+
+def create_app() -> Flask:
+    return app
 
 _latest_health_packet = None   # Chỉ chứa vitals (health_update)
 _latest_fall_packet = None     # Chỉ chứa fall result (fall_update)
@@ -381,10 +353,7 @@ def _append_history(packet: dict):
     Lưu đầy đủ: saved_at + toàn bộ fields (type, source_topic,
     server_timestamp, data.bpm, data.spo2, data.temp, data.status, data.ts).
     """
-    history_line = {"saved_at": int(time.time()), **packet}
-    with _history_lock:
-        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(history_line, ensure_ascii=False) + "\n")
+    append_jsonl_record(HISTORY_FILE, packet, lock=_history_lock)
 
 
 def _append_fall_history(packet: dict):
@@ -393,10 +362,7 @@ def _append_fall_history(packet: dict):
     Lưu đầy đủ: saved_at + toàn bộ fields (type, source_topic,
     server_timestamp, fall.detected, fall.confidence).
     """
-    history_line = {"saved_at": int(time.time()), **packet}
-    with _history_lock:
-        with open(FALL_HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(history_line, ensure_ascii=False) + "\n")
+    append_jsonl_record(FALL_HISTORY_FILE, packet, lock=_history_lock)
 
 
 def _handle_alert_over_3_batches(health_samples):
@@ -484,40 +450,12 @@ def _handle_alert_over_3_batches(health_samples):
 
 def _read_history(limit: int = 50) -> list:
     """Đọc lịch sử health_update từ HISTORY_FILE, mới nhất trước."""
-    if limit <= 0 or not os.path.exists(HISTORY_FILE):
-        return []
-    with _history_lock:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    records = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records[-limit:][::-1]
+    return read_jsonl_records(HISTORY_FILE, limit=limit, lock=_history_lock)
 
 
 def _read_fall_history(limit: int = 50) -> list:
     """Đọc lịch sử fall_update từ FALL_HISTORY_FILE, mới nhất trước."""
-    if limit <= 0 or not os.path.exists(FALL_HISTORY_FILE):
-        return []
-    with _history_lock:
-        with open(FALL_HISTORY_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    records = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return records[-limit:][::-1]
+    return read_jsonl_records(FALL_HISTORY_FILE, limit=limit, lock=_history_lock)
 
 
 def _to_number(value):
@@ -1236,6 +1174,9 @@ def _stop_buzzer():
 
 
 def build_mqtt_client():
+    if mqtt is None:
+        raise RuntimeError("Thieu paho-mqtt. Cai dat bang: pip install -r requirements.txt")
+
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=CLIENT_ID,

@@ -1,0 +1,48 @@
+{
+  "model_type": "multi_stage_gated_1d_cnn",
+  "created_at": "2026-06-03 14:17:42",
+  "window_size": 200,
+  "target_hz": 100,
+  "window_seconds": 2.0,
+  "stride": 100,
+  "feature_keys": [
+    "ax",
+    "ay",
+    "az",
+    "gx",
+    "gy",
+    "gz",
+    "acc_mag",
+    "gyro_mag"
+  ],
+  "threshold": 0.9,
+  "threshold_source": "umafall_val",
+  "threshold_metrics": {
+    "threshold": 0.9,
+    "precision": 0.7311475409836066,
+    "recall": 0.902834008097166,
+    "f1": 0.8079710144927537
+  },
+  "trained_stages": [
+    "stage1_public_pretrain",
+    "stage2_umafall_chest_finetune"
+  ],
+  "datasets": [
+    "umafall"
+  ],
+  "post_filter": {
+    "enabled": true,
+    "kind": "single_window_peak_filter",
+    "min_acc_peak_g": 1.8,
+    "min_gyro_peak_dps": 80.0,
+    "confirm_windows": 1,
+    "cooldown_seconds": 5.0,
+    "note": "Peak filter only; not a complete realtime post-fall verification."
+  },
+  "notes": [
+    "Model is trained from scratch in this notebook, then fine-tuned stage by stage.",
+    "Artifacts are saved outside production by default to avoid overwriting the current backend model.",
+    "No Lambda/custom layer is used, so Keras safe loading is simpler.",
+    "post_filter is currently a single-window peak filter; full post-fall confirmation should be implemented in backend runtime."
+  ]
+}

@@ -422,7 +422,7 @@ def _build_health_data_sample(
 # EMA (Exponential Moving Average): T_smooth = 0.5T + 0.5T_old
 
 _last_temperature = 36.5
-_temperature_lock = None  # Will be set by app.py if needed
+_temperature_lock = None
 
 def _median_filter_temperature(temps: List[float]) -> float:
     
