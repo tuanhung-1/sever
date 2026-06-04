@@ -37,6 +37,23 @@ MAX_BPM = 220.0
 MIN_SPO2 = 70.0
 MAX_SPO2 = 100.0
 
+# PPG window / smoothing (aligned with firmware SPO2_WINDOW_SIZE=400, step=200)
+MIN_PPG_SAMPLES_FOR_ESTIMATE = 80
+VITAL_EMA_ALPHA_BPM = 0.18
+VITAL_EMA_ALPHA_SPO2 = 0.12
+VITAL_EMA_ALPHA_TEMP = 0.25
+VITAL_MAX_REL_CHANGE_BPM = 0.12
+VITAL_MAX_ABS_CHANGE_SPO2 = 2.5
+
+# SpO2 calibration (MAX3010x empirical; align with firmware checkPPGQuality)
+SPO2_CAL_A = float(os.getenv("SPO2_CAL_A", "110"))
+SPO2_CAL_B = float(os.getenv("SPO2_CAL_B", "12"))
+
+# Timestamp gap multiplier vs median sample interval → split PPG segment
+PPG_GAP_INTERVAL_MULTIPLIER = 2.5
+# Rolling-baseline deviation → invalidate motion/DC-step artifact (e.g. finger press)
+PPG_DC_STEP_INVALIDATE_PCT = 0.035
+
 
 # ─── Data structures ──────────────────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -144,6 +161,39 @@ def _sample_rate_hz(sample_interval_ms: int) -> float:
     return 1000.0 / float(max(1, sample_interval_ms))
 
 
+def smooth_vital_ema(
+    current: float | None,
+    ema: float | None,
+    alpha: float,
+    *,
+    max_rel_change: float | None = None,
+    max_abs_change: float | None = None,
+) -> tuple[float | None, float | None]:
+    """
+    EMA with optional outlier gate vs previous smoothed value.
+    Returns (value_for_display, updated_ema_state).
+    """
+    if current is None:
+        return ema, ema
+
+    current_f = float(current)
+    if ema is None:
+        return current_f, current_f
+
+    ema_f = float(ema)
+    if max_rel_change is not None and ema_f > 0:
+        rel = abs(current_f - ema_f) / ema_f
+        if rel > max_rel_change:
+            return ema_f, ema_f
+
+    if max_abs_change is not None:
+        if abs(current_f - ema_f) > max_abs_change:
+            return ema_f, ema_f
+
+    updated = alpha * current_f + (1.0 - alpha) * ema_f
+    return updated, updated
+
+
 def _infer_sample_interval_ms(
     normalized: Dict[str, Any],
     sample_count: int,
@@ -211,12 +261,135 @@ def _split_contiguous_valid_segments(values: List[int] | None, min_valid_value: 
     return segments
 
 
+def _invalidate_ppg_gaps_and_artifacts(
+    values: List[int | None],
+    sample_interval_ms: int,
+    timestamps: List[int] | None = None,
+) -> List[int | None]:
+    """Mark samples invalid at timing gaps and large DC steps (motion artifacts)."""
+    if not values:
+        return values
+
+    n = len(values)
+    invalid = [False] * n
+
+    if timestamps and len(timestamps) == n:
+        dts: List[int] = []
+        for i in range(1, n):
+            if timestamps[i] is None or timestamps[i - 1] is None:
+                continue
+            dt = int(timestamps[i]) - int(timestamps[i - 1])
+            if dt > 0:
+                dts.append(dt)
+        gap_ms = max(50, int(sample_interval_ms * PPG_GAP_INTERVAL_MULTIPLIER))
+        if dts:
+            median_dt = int(np.median(np.array(dts, dtype=np.int64)))
+            gap_ms = max(gap_ms, int(median_dt * PPG_GAP_INTERVAL_MULTIPLIER))
+        for i in range(1, n):
+            if timestamps[i] is None or timestamps[i - 1] is None:
+                continue
+            if int(timestamps[i]) - int(timestamps[i - 1]) > gap_ms:
+                invalid[i] = True
+
+    arr = np.array(
+        [float(v) if v is not None and int(v) > 0 else np.nan for v in values],
+        dtype=np.float64,
+    )
+    window = max(5, int(1000.0 / max(1, sample_interval_ms) * 0.35))
+    for i in range(n):
+        if invalid[i] or not np.isfinite(arr[i]):
+            continue
+        start = max(0, i - window)
+        baseline = np.nanmedian(arr[start:i]) if i > start else arr[i]
+        if not np.isfinite(baseline) or baseline <= 0:
+            continue
+        if abs(arr[i] - baseline) / baseline > PPG_DC_STEP_INVALIDATE_PCT:
+            invalid[i] = True
+
+    # Sharp DC step: drop >6% vs local median in ~0.5s (finger press), not normal PPG ripple
+    step_window = max(5, int(1000.0 / max(1, sample_interval_ms) * 0.5))
+    for i in range(n):
+        if invalid[i] or not np.isfinite(arr[i]):
+            continue
+        start = max(0, i - step_window)
+        local = arr[start : i + 1]
+        local = local[np.isfinite(local)]
+        if local.size < 3:
+            continue
+        baseline = float(np.median(local))
+        if baseline > 0 and (baseline - float(arr[i])) / baseline > 0.06:
+            invalid[i] = True
+
+    out: List[int | None] = []
+    for i, v in enumerate(values):
+        if invalid[i] or v is None or int(v) <= 0:
+            out.append(None)
+        else:
+            out.append(int(v))
+    return out
+
+
 def _remove_dc(signal: np.ndarray, window_size: int) -> np.ndarray:
     if window_size < 2 or signal.size == 0:
         return signal - float(np.mean(signal))
     kernel = np.ones(window_size, dtype=np.float64) / float(window_size)
     baseline = np.convolve(signal, kernel, mode="same")
     return signal - baseline
+
+
+def _estimate_bpm_autocorr(signal: np.ndarray, sample_rate_hz: float) -> float | None:
+    if signal.size < 40:
+        return None
+
+    centered = signal.astype(np.float64) - float(np.mean(signal))
+    std = float(np.std(centered))
+    if std <= 1e-6:
+        return None
+    centered = centered / std
+
+    corr = np.correlate(centered, centered, mode="full")
+    corr = corr[corr.size // 2 :]
+    min_lag = max(1, int(sample_rate_hz * 60.0 / MAX_BPM))
+    max_lag = min(len(corr) - 1, int(sample_rate_hz * 60.0 / MIN_BPM))
+    if max_lag <= min_lag:
+        return None
+
+    segment = corr[min_lag : max_lag + 1]
+    if segment.size == 0:
+        return None
+
+    peak_lag: int | None = None
+    max_v = float(np.max(segment))
+    for i in range(1, len(segment) - 1):
+        if segment[i] < segment[i - 1] or segment[i] < segment[i + 1]:
+            continue
+        if segment[i] < 0.5 * max_v:
+            continue
+        peak_lag = min_lag + i
+        break
+
+    if peak_lag is None:
+        peak_lag = min_lag + int(np.argmax(segment))
+
+    if peak_lag <= 0:
+        return None
+
+    bpm = 60.0 * sample_rate_hz / float(peak_lag)
+    return float(np.clip(bpm, MIN_BPM, MAX_BPM))
+
+
+def _filter_rr_intervals_iqr(rr_seconds: np.ndarray) -> np.ndarray:
+    if rr_seconds.size < 2:
+        return rr_seconds
+
+    q1, q3 = np.percentile(rr_seconds, [25, 75])
+    iqr = q3 - q1
+    if iqr <= 0:
+        return rr_seconds
+
+    low = q1 - 1.5 * iqr
+    high = q3 + 1.5 * iqr
+    return rr_seconds[(rr_seconds >= low) & (rr_seconds <= high)]
 
 
 def _bandpass_fft(signal: np.ndarray, sample_rate_hz: float, low_hz: float, high_hz: float) -> np.ndarray:
@@ -229,25 +402,72 @@ def _bandpass_fft(signal: np.ndarray, sample_rate_hz: float, low_hz: float, high
     return np.fft.irfft(spectrum, n=signal.size)
 
 
-def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> float | None:
-    # Allow lists that contain invalid points (0 or None) by splitting into contiguous valid segments
-    if not ir_values:
+def _estimate_bpm_fft(signal: np.ndarray, sample_rate_hz: float) -> float | None:
+    """Dominant frequency in cardiac band (robust on short MAX3010x windows)."""
+    if signal.size < 40:
         return None
 
-    segments = _split_contiguous_valid_segments(ir_values, min_valid_value=1)
-    if not segments:
+    centered = signal.astype(np.float64) - float(np.mean(signal))
+    if float(np.std(centered)) <= 1e-6:
         return None
 
-    # Choose best segment: prefer longest one
-    best_start, best_seg = max(segments, key=lambda s: len(s[1]))
-    if len(best_seg) < 20:
-        # Try next longest segment if exists
-        longer = [seg for seg in segments if len(seg[1]) >= 20]
-        if not longer:
-            return None
-        best_start, best_seg = max(longer, key=lambda s: len(s[1]))
+    spectrum = np.abs(np.fft.rfft(centered))
+    freqs = np.fft.rfftfreq(centered.size, d=1.0 / sample_rate_hz)
+    mask = (freqs >= 0.75) & (freqs <= 2.5)
+    if not np.any(mask):
+        return None
 
-    signal = np.array(best_seg, dtype=np.float64)
+    band_freqs = freqs[mask]
+    band_mag = spectrum[mask]
+    peak_mag = float(np.max(band_mag))
+    if peak_mag <= 0:
+        return None
+
+    # Prefer fundamental (lowest strong spectral line), not 2× harmonic.
+    strong_freqs: List[float] = []
+    for i in range(1, len(band_mag) - 1):
+        if band_mag[i] < band_mag[i - 1] or band_mag[i] < band_mag[i + 1]:
+            continue
+        if band_mag[i] < 0.55 * peak_mag:
+            continue
+        strong_freqs.append(float(band_freqs[i]))
+
+    if strong_freqs:
+        peak_f = min(strong_freqs)
+    else:
+        peak_f = float(band_freqs[int(np.argmax(band_mag))])
+
+    if peak_f <= 0:
+        return None
+
+    return float(np.clip(peak_f * 60.0, MIN_BPM, MAX_BPM))
+
+
+def _resolve_bpm_estimates(estimates: List[float]) -> float | None:
+    if not estimates:
+        return None
+
+    in_range = [e for e in estimates if BPM_LOW_THRESHOLD <= e <= BPM_HIGH_THRESHOLD]
+    pool = in_range if in_range else estimates
+
+    # Sub-harmonic fix: if all estimates are too low, try doubling once
+    if pool and max(pool) < 55.0:
+        doubled = [e * 2.0 for e in pool if e * 2.0 <= MAX_BPM]
+        doubled_in = [e for e in doubled if BPM_LOW_THRESHOLD <= e <= BPM_HIGH_THRESHOLD]
+        if doubled_in:
+            pool = doubled_in
+
+    # Supra-harmonic fix: if estimate > 100, try half
+    if pool and min(pool) > 100.0:
+        halved = [e / 2.0 for e in pool if e / 2.0 >= MIN_BPM]
+        halved_in = [e for e in halved if BPM_LOW_THRESHOLD <= e <= BPM_HIGH_THRESHOLD]
+        if halved_in:
+            pool = halved_in
+
+    return float(np.median(np.array(pool, dtype=np.float64)))
+
+
+def _estimate_bpm_from_ir_segment(signal: np.ndarray, sample_rate_hz: float) -> float | None:
     if signal.size < 20:
         return None
 
@@ -257,19 +477,22 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
     if mean_signal <= 1e-6 or rel_std < 1e-4:
         return None
 
-    sample_rate_hz = _sample_rate_hz(sample_interval_ms)
     dc_window = max(2, int(sample_rate_hz * 0.5))
     centered = _remove_dc(signal, dc_window)
     filtered = _bandpass_fft(centered, sample_rate_hz, 0.5, 4.0)
 
     filtered_std = float(np.std(filtered))
     if filtered_std <= 1e-6:
-        print("⚠️  IR filtered std too low, skip BPM")
         return None
 
+    estimates: List[float] = []
+    bpm_fft = _estimate_bpm_fft(filtered, sample_rate_hz)
+    if bpm_fft is not None:
+        estimates.append(bpm_fft)
+
     normalized = filtered / filtered_std
-    threshold = max(0.8, 1.2 * float(np.std(normalized)))
-    min_gap = max(1, int(sample_rate_hz * 0.40))
+    threshold = max(0.25, float(np.percentile(normalized, 65)))
+    min_gap = max(1, int(sample_rate_hz * 0.35))
 
     peaks: List[int] = []
     for idx in range(1, len(normalized) - 1):
@@ -284,18 +507,130 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
         if centered[idx] > centered[peaks[-1]]:
             peaks[-1] = idx
 
-    if len(peaks) < 2:
+    bpm_ac = _estimate_bpm_autocorr(filtered, sample_rate_hz)
+    if bpm_ac is not None:
+        estimates.append(bpm_ac)
+
+    if len(peaks) >= 2:
+        rr_seconds = np.diff(peaks) / sample_rate_hz
+        min_rr = 60.0 / MAX_BPM
+        max_rr = 60.0 / MIN_BPM
+        rr_seconds = rr_seconds[(rr_seconds > min_rr) & (rr_seconds < max_rr)]
+        if rr_seconds.size >= 2:
+            rr_seconds = _filter_rr_intervals_iqr(rr_seconds)
+        if rr_seconds.size > 0:
+            estimates.append(60.0 / float(np.median(rr_seconds)))
+
+    return _resolve_bpm_estimates(estimates)
+
+
+def _segment_cardiac_score(signal: np.ndarray, sample_rate_hz: float) -> float:
+    if signal.size < 20:
+        return 0.0
+    dc_window = max(2, int(sample_rate_hz * 0.5))
+    filtered = _bandpass_fft(_remove_dc(signal, dc_window), sample_rate_hz, 0.5, 4.0)
+    mean_val = float(np.mean(np.abs(signal)))
+    if mean_val <= 0:
+        return 0.0
+    return float(np.std(filtered)) / mean_val
+
+
+def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> float | None:
+    if not ir_values:
         return None
 
-    rr_seconds = np.diff(peaks) / sample_rate_hz
-    min_rr = 60.0 / MAX_BPM
-    max_rr = 60.0 / MIN_BPM
-    rr_seconds = rr_seconds[(rr_seconds > min_rr) & (rr_seconds < max_rr)]
-    if rr_seconds.size == 0:
+    segments = _split_contiguous_valid_segments(ir_values, min_valid_value=1)
+    if not segments:
         return None
 
-    bpm = 60.0 / float(np.median(rr_seconds))
-    return float(np.clip(bpm, MIN_BPM, MAX_BPM))
+    sample_rate_hz = _sample_rate_hz(sample_interval_ms)
+    scored: List[tuple[float, float]] = []
+
+    win = max(40, int(sample_rate_hz * 1.7))
+    stride = max(8, win // 4)
+
+    for _start, seg in segments:
+        if len(seg) < 40:
+            continue
+        arr = np.array(seg, dtype=np.float64)
+        window_bpms: List[float] = []
+
+        if len(seg) >= win:
+            for offset in range(0, len(seg) - win + 1, stride):
+                chunk = arr[offset : offset + win]
+                peak = float(np.max(chunk))
+                trough = float(np.min(chunk))
+                if peak > 0 and (peak - trough) / peak > 0.035:
+                    continue
+                bpm = _estimate_bpm_from_ir_segment(chunk, sample_rate_hz)
+                if bpm is not None:
+                    window_bpms.append(bpm)
+        else:
+            peak = float(np.max(arr))
+            trough = float(np.min(arr))
+            if peak > 0 and (peak - trough) / peak <= 0.035:
+                bpm = _estimate_bpm_from_ir_segment(arr, sample_rate_hz)
+                if bpm is not None:
+                    window_bpms.append(bpm)
+
+        bpm = _resolve_bpm_estimates(window_bpms)
+        if bpm is None:
+            continue
+        score = _segment_cardiac_score(arr, sample_rate_hz)
+        scored.append((score, bpm))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:2]
+    bpms = [b for _s, b in top if BPM_LOW_THRESHOLD <= b <= BPM_HIGH_THRESHOLD]
+    if not bpms:
+        bpms = [b for _s, b in top]
+    return _resolve_bpm_estimates(bpms)
+
+
+def _estimate_spo2_from_acdc_ratio(ratio: float) -> float | None:
+    if ratio <= 0 or not np.isfinite(ratio):
+        return None
+    ratio = float(np.clip(ratio, 0.4, 1.6))
+    spo2 = SPO2_CAL_A - SPO2_CAL_B * ratio
+    return float(np.clip(spo2, MIN_SPO2, MAX_SPO2))
+
+
+def _estimate_spo2_from_quality(quality: Dict[str, Any]) -> float | None:
+    """Use ir_acdc/red_acdc from firmware (same window, peak-to-peak / mean)."""
+    if not isinstance(quality, dict) or not quality.get("valid", False):
+        return None
+    try:
+        ir_acdc = float(quality["ir_acdc"])
+        red_acdc = float(quality["red_acdc"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if ir_acdc <= 0:
+        return None
+    return _estimate_spo2_from_acdc_ratio(red_acdc / ir_acdc)
+
+
+def _estimate_spo2_from_p2p(ir_values: List[int], red_values: List[int]) -> float | None:
+    """Peak-to-peak / mean — matches ESP32 checkPPGQuality()."""
+    ir_valid = [int(v) for v in ir_values if v is not None and int(v) > 0]
+    red_valid = [int(v) for v in red_values if v is not None and int(v) > 0]
+    if len(ir_valid) < 20 or len(red_valid) < 20:
+        return None
+
+    ir_arr = np.array(ir_valid, dtype=np.float64)
+    red_arr = np.array(red_valid, dtype=np.float64)
+    ir_dc = float(np.mean(ir_arr))
+    red_dc = float(np.mean(red_arr))
+    if ir_dc <= 0 or red_dc <= 0:
+        return None
+
+    ir_acdc = (float(np.max(ir_arr)) - float(np.min(ir_arr))) / ir_dc
+    red_acdc = (float(np.max(red_arr)) - float(np.min(red_arr))) / red_dc
+    if ir_acdc <= 0:
+        return None
+    return _estimate_spo2_from_acdc_ratio(red_acdc / ir_acdc)
 
 
 def _estimate_spo2_from_ir_red(
@@ -304,12 +639,7 @@ def _estimate_spo2_from_ir_red(
     sample_interval_ms: int,
 ) -> float | None:
     """
-    Estimate SpO2 using AC/DC method.
-    
-    Công thức:
-      DC = mean(signal)
-      AC = RMS(signal - DC) = sqrt(mean((signal - DC)²))
-      SpO₂ = 110 - 25 × (AC_red/DC_red) / (AC_ir/DC_ir)
+    Estimate SpO2 using AC/DC ratio (p2p/mean preferred; bandpass fallback).
     """
     # Find overlapping valid contiguous segments where both IR and RED >=1
     ir_segs = _split_contiguous_valid_segments(ir_values, min_valid_value=1)
@@ -337,37 +667,26 @@ def _estimate_spo2_from_ir_red(
                     best_len = overlap_len
     
     if best_segment is None:
-        return None
+        return _estimate_spo2_from_p2p(ir_values, red_values)
 
-    overlap_start, ir_slice, red_slice = best_segment
+    _overlap_start, ir_slice, red_slice = best_segment
+    p2p_spo2 = _estimate_spo2_from_p2p(ir_slice, red_slice)
+    if p2p_spo2 is not None:
+        return p2p_spo2
 
     ir = np.array(ir_slice, dtype=np.float64)
     red = np.array(red_slice, dtype=np.float64)
-
     sample_rate_hz = _sample_rate_hz(sample_interval_ms)
     dc_window = max(2, int(sample_rate_hz * 0.5))
-
     ir_dc = float(np.mean(ir))
     red_dc = float(np.mean(red))
-
-    ir_centered = _remove_dc(ir, dc_window)
-    red_centered = _remove_dc(red, dc_window)
-
-    ir_filt = _bandpass_fft(ir_centered, sample_rate_hz, 0.5, 4.0)
-    red_filt = _bandpass_fft(red_centered, sample_rate_hz, 0.5, 4.0)
-
+    ir_filt = _bandpass_fft(_remove_dc(ir, dc_window), sample_rate_hz, 0.5, 4.0)
+    red_filt = _bandpass_fft(_remove_dc(red, dc_window), sample_rate_hz, 0.5, 4.0)
     ir_ac = float(np.std(ir_filt))
     red_ac = float(np.std(red_filt))
-
     if ir_dc <= 1e-6 or red_dc <= 1e-6 or ir_ac <= 1e-6:
         return None
-
-    # Ratio: (AC_red/DC_red) / (AC_ir/DC_ir)
-    ratio = (red_ac / red_dc) / (ir_ac / ir_dc)
-
-    # SpO₂ formula
-    spo2 = 120.0 - 25.0 * ratio
-    return float(np.clip(spo2, MIN_SPO2, MAX_SPO2))
+    return _estimate_spo2_from_acdc_ratio((red_ac / red_dc) / (ir_ac / ir_dc))
 
 
 # ─── Payload normalization ───────────────────────────────────────────────────
@@ -448,10 +767,10 @@ def _ema_smooth_temperature(temp_new: float, temp_old: float = None, alpha: floa
     if temp_old is None:
         temp_old = _last_temperature
     
-    temp_smooth = alpha * temp_new + (1 - alpha) * temp_old
+    temp_smooth = alpha * temp_new + (1.0 - alpha) * temp_old
     _last_temperature = temp_smooth
-    
-    return temp_smooth+0.5
+
+    return temp_smooth
 
 
 # ─── Public payload parsers ───────────────────────────────────────────────────
@@ -501,7 +820,14 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     else:
         batch_start_timestamp = batch_end_timestamp - (sample_count - 1) * sample_interval_ms
 
-    temp_value = _to_float(normalized.get("temp", 0.0), "temp")
+    raw_temp = normalized.get("temp")
+    if raw_temp is not None:
+        temp_value = _ema_smooth_temperature(
+            _to_float(raw_temp, "temp"),
+            alpha=VITAL_EMA_ALPHA_TEMP,
+        )
+    else:
+        temp_value = _last_temperature
 
     # Mark invalid optical samples (<=0) as None so estimators can skip them
     raw_ir_series = _sanitize_optical_series(ir_series) if ir_series is not None else None
@@ -515,19 +841,37 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     if raw_red_series is not None:
         marked_red_series = [v if (v is not None and int(v) > 0) else None for v in raw_red_series]
 
+    ppg_timestamps = normalized.get("ppg_timestamps")
+    if isinstance(ppg_timestamps, list) and marked_ir_series is not None:
+        marked_ir_series = _invalidate_ppg_gaps_and_artifacts(
+            marked_ir_series,
+            sample_interval_ms,
+            timestamps=ppg_timestamps,
+        )
+        if marked_red_series is not None:
+            marked_red_series = _invalidate_ppg_gaps_and_artifacts(
+                marked_red_series,
+                sample_interval_ms,
+                timestamps=ppg_timestamps,
+            )
+
     heart_rate: float | None = None
     if _is_valid_vital(normalized.get("heart_rate")):
         heart_rate = _to_float(normalized["heart_rate"], "heart_rate")
     elif marked_ir_series is not None:
         heart_rate = _estimate_bpm_from_ir(marked_ir_series, sample_interval_ms)
 
-    # preserve None if heart rate estimation failed so callers can display empty/missing value
-
     spo2_value: float | None = None
     if _is_valid_vital(normalized.get("spo2")):
         spo2_value = _to_float(normalized["spo2"], "spo2")
-    elif marked_ir_series is not None and marked_red_series is not None:
-        spo2_value = _estimate_spo2_from_ir_red(marked_ir_series, marked_red_series, sample_interval_ms)
+    else:
+        quality = normalized.get("quality")
+        if isinstance(quality, dict):
+            spo2_value = _estimate_spo2_from_quality(quality)
+        if spo2_value is None and marked_ir_series is not None and marked_red_series is not None:
+            spo2_value = _estimate_spo2_from_ir_red(
+                marked_ir_series, marked_red_series, sample_interval_ms
+            )
 
     samples: List[HealthData] = []
     for idx in range(sample_count):
