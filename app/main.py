@@ -978,7 +978,25 @@ def on_message(client, userdata, msg):
             )
 
             if model_samples:
-                spo2 = model_samples[-1].spo2
+                latest_sample = model_samples[-1]
+
+                if _is_valid_vital_value(
+                    "heart_rate",
+                    getattr(latest_sample, "heart_rate", None),
+                ):
+                    bpm_ppg = float(latest_sample.heart_rate)
+
+                if _is_valid_vital_value(
+                    "spo2",
+                    getattr(latest_sample, "spo2", None),
+                ):
+                    spo2 = float(latest_sample.spo2)
+
+                if _is_valid_vital_value(
+                    "temp",
+                    getattr(latest_sample, "temp", None),
+                ):
+                    temp = float(latest_sample.temp)
 
         except Exception as exc:
             print(f"⚠️ SpO2 calculation error: {exc}")
@@ -989,6 +1007,9 @@ def on_message(client, userdata, msg):
         global _latest_hr
         global _latest_spo2
         global _last_valid_vitals
+
+        bpm_raw = bpm_ppg
+        spo2_raw = spo2
 
         with _ema_lock:
             if bpm_ppg is not None:
@@ -1004,10 +1025,8 @@ def on_message(client, userdata, msg):
 
                 ema_bpm = round(_ema_bpm, 1)
 
-                # lưu realtime BPM
-                bpm_ppg = raw_bpm
-
-                # lưu EMA BPM riêng
+                # Ưu tiên giá trị đã làm mượt để giữ ổn định giữa các batch
+                bpm_ppg = ema_bpm
                 _last_valid_vitals["heart_rate"] = ema_bpm
             else:
 
@@ -1066,18 +1085,24 @@ def on_message(client, userdata, msg):
             f"EMA SpO2={spo2}"
 )
         ts = raw_payload.get("ts") or (data[-1]["t"] if data else None)
+        status = classify(bpm_ppg, temp, spo2)
         packet = {
             "type": "health_update",
             "source_topic": msg.topic,
             "server_timestamp": int(time.time()),
             "data": {
                 "ts": ts,
-                "bpm": bpm_ppg ,
+                "bpm": bpm_ppg,
                 "spo2": spo2,
                 "temp": temp,
-                "status": "NORMAL"
+                "status": status,
+                "bpm_raw": bpm_raw,
+                "spo2_raw": spo2_raw,
+                "quality": raw_payload.get("quality", {}),
             }
         }
+        with _packet_lock:
+            _latest_health_packet = packet
         _append_history(packet)
         _emit_health(packet, delay_ms=WS_HEALTH_EMIT_DELAY_MS)
         print(f"💓 [HEALTH_UPDATE] BPM={packet['data']['bpm']} SpO2={packet['data']['spo2']} Temp={packet['data']['temp']}")
