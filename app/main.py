@@ -18,7 +18,7 @@ from flask import Flask, jsonify, request
 from app.core.config import settings
 from app.core.extensions import socketio
 from app.models.fall import create_fall_model
-from app.models.health import from_json_samples, classify, STATUS_FALL_DETECTED
+from app.models.health import from_json_samples, classify, STATUS_FALL_DETECTED, estimate_bpm_from_ppg_values
 from app.repositories.history_repository import append_jsonl_record, read_jsonl_records
 
 _buzzer_active = False
@@ -84,6 +84,16 @@ def calculate_bpm_from_samples(samples):
 
     ir = [x['ir'] for x in samples]
     t = [x['t'] for x in samples]
+    intervals = [
+        t[i] - t[i - 1]
+        for i in range(1, len(t))
+        if isinstance(t[i], (int, float)) and isinstance(t[i - 1], (int, float)) and t[i] > t[i - 1]
+    ]
+    if intervals:
+        sample_interval_ms = int(round(float(np.median(intervals))))
+        bpm = estimate_bpm_from_ppg_values(ir, sample_interval_ms)
+        if bpm is not None:
+            return round(float(bpm), 1)
 
     filtered = moving_average(ir, 2)
 
@@ -165,6 +175,11 @@ _latest_vitals_lock = Lock()
 
 # Last valid vitals preserved across packets
 _last_valid_vitals = {"heart_rate": None, "spo2": None, "temp": None}
+_last_valid_vital_times = {"heart_rate": None, "spo2": None, "temp": None}
+_recent_bpm_values = deque(maxlen=7)
+_recent_spo2_values = deque(maxlen=5)
+_recent_temp_values = deque(maxlen=5)
+VITAL_STALE_AFTER_S = 12.0
 
 # ── Smooth BPM/SpO2 với EMA ──────────────────────────────────────────────
 
@@ -172,8 +187,8 @@ _ema_bpm = None
 _ema_spo2 = None
 
 # Alpha càng thấp -> càng mượt nhưng phản hồi chậm
-EMA_ALPHA_BPM = 0.25
-EMA_ALPHA_SPO2 = 0.20
+EMA_ALPHA_BPM = 0.08
+EMA_ALPHA_SPO2 = 0.10
 
 _ema_lock = Lock()
 
@@ -183,10 +198,10 @@ def _is_valid_vital_value(key: str, value):
             return False
         if key == "heart_rate":
             v = float(value)
-            return v > 0 and v < 300
+            return 35.0 <= v <= 220.0
         if key == "spo2":
             v = float(value)
-            return 50.0 <= v <= 200.0
+            return 70.0 <= v <= 100.0
         if key == "temp":
             v = float(value)
             return 25.0 <= v <= 45.0
@@ -211,6 +226,168 @@ def _apply_ema(current_value, ema_value, alpha):
         alpha * float(current_value)
         + (1.0 - alpha) * float(ema_value)
     )
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _quality_is_valid(quality: dict) -> bool:
+    if not isinstance(quality, dict):
+        return True
+    valid = quality.get("valid", True)
+    if isinstance(valid, str):
+        return valid.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(valid)
+
+
+def _quality_confidence(quality: dict) -> float:
+    if not _quality_is_valid(quality):
+        return 0.0
+    if not isinstance(quality, dict):
+        return 0.75
+
+    confidence = 1.0
+
+    motion = _to_number(quality.get("bad_motion_rate"))
+    if motion is not None:
+        motion = _clamp(float(motion), 0.0, 0.25)
+        confidence *= _clamp(1.0 - motion / 0.25 * 0.65, 0.35, 1.0)
+
+    max_jerk = _to_number(quality.get("max_jerk"))
+    if max_jerk is not None and max_jerk > 8.0:
+        confidence *= _clamp(1.0 - (float(max_jerk) - 8.0) / 20.0 * 0.55, 0.45, 1.0)
+
+    for key in ("ir_acdc", "red_acdc"):
+        acdc = _to_number(quality.get(key))
+        if acdc is None:
+            continue
+        if acdc < 0.004 or acdc > 0.18:
+            confidence *= 0.75
+
+    status = str(quality.get("status", "GOOD")).upper()
+    if status not in {"GOOD", "UNKNOWN"}:
+        confidence *= 0.60
+
+    return round(_clamp(confidence, 0.0, 1.0), 3)
+
+
+def _ppg_signal_is_usable(quality: dict) -> bool:
+    if not _quality_is_valid(quality):
+        return False
+    if not isinstance(quality, dict):
+        return True
+
+    ir_p2p = _to_number(quality.get("ir_p2p"))
+    red_p2p = _to_number(quality.get("red_p2p"))
+    ir_acdc = _to_number(quality.get("ir_acdc"))
+    red_acdc = _to_number(quality.get("red_acdc"))
+    motion = _to_number(quality.get("bad_motion_rate"))
+
+    if ir_p2p is not None and ir_p2p < 700:
+        return False
+    if red_p2p is not None and red_p2p < 300:
+        return False
+    if ir_acdc is not None and ir_acdc < 0.0035:
+        return False
+    if red_acdc is not None and red_acdc < 0.0035:
+        return False
+    if motion is not None and motion > 0.20:
+        return False
+
+    return True
+
+
+def _last_average(values) -> float | None:
+    numeric = [float(v) for v in values if v is not None]
+    if not numeric:
+        return None
+    ordered = sorted(numeric)
+    if len(ordered) >= 5:
+        ordered = ordered[1:-1]
+    return sum(ordered) / len(ordered)
+
+
+def _adaptive_alpha(base_alpha: float, confidence: float) -> float:
+    confidence = _clamp(float(confidence), 0.0, 1.0)
+    return _clamp(
+        base_alpha * (0.60 + confidence),
+        base_alpha * 0.50,
+        min(0.60, base_alpha * 1.80),
+    )
+
+
+def _get_recent_valid_value(key: str, now_mono: float):
+    value = _last_valid_vitals.get(key)
+    updated_at = _last_valid_vital_times.get(key)
+    if value is None:
+        return None, True
+    if updated_at is None:
+        return value, False
+    stale = (now_mono - updated_at) > VITAL_STALE_AFTER_S
+    return (None if stale else value), stale
+
+
+def _smooth_vital_value(
+    key: str,
+    raw_value,
+    ema_value,
+    recent_values,
+    base_alpha: float,
+    confidence: float,
+    jump_threshold: float,
+    max_delta_per_update: float | None,
+    decimals: int,
+    now_mono: float,
+):
+    if not _is_valid_vital_value(key, raw_value):
+        fallback, stale = _get_recent_valid_value(key, now_mono)
+        return fallback, ema_value, stale, False, None
+
+    raw = round(float(raw_value), decimals)
+    recent_values.append(raw)
+    averaged = _last_average(recent_values)
+    stable_input = raw if averaged is None else round(averaged, decimals)
+
+    alpha = _adaptive_alpha(base_alpha, confidence)
+    if ema_value is not None:
+        jump = abs(raw - float(ema_value))
+        if jump >= jump_threshold:
+            alpha = min(alpha, base_alpha * 0.75)
+        if key == "heart_rate" and jump >= 35.0 and raw < float(ema_value):
+            alpha = max(alpha, 0.30)
+            if max_delta_per_update is not None:
+                max_delta_per_update = max(max_delta_per_update, 12.0)
+
+    smoothed = _apply_ema(stable_input, ema_value, alpha)
+    if ema_value is not None and max_delta_per_update is not None:
+        smoothed = _clamp(
+            smoothed,
+            float(ema_value) - max_delta_per_update,
+            float(ema_value) + max_delta_per_update,
+        )
+    return round(smoothed, decimals), smoothed, False, True, stable_input
+
+
+def _choose_bpm_estimate(primary_bpm, fallback_bpm):
+    primary_ok = _is_valid_vital_value("heart_rate", primary_bpm)
+    fallback_ok = _is_valid_vital_value("heart_rate", fallback_bpm)
+
+    if primary_ok and fallback_ok:
+        primary = float(primary_bpm)
+        fallback = float(fallback_bpm)
+        diff = abs(primary - fallback)
+        if diff >= 25.0:
+            return fallback, "fallback_disagreement"
+        if primary >= 130.0 and fallback <= 110.0:
+            return fallback, "fallback_harmonic_guard"
+        return primary, "primary"
+
+    if primary_ok:
+        return float(primary_bpm), "primary_only"
+    if fallback_ok:
+        return float(fallback_bpm), "fallback_only"
+    return None, "missing"
 # ── Trạng thái luồng Fall_Raw ────────────────────────────────────────────────
 _waiting_for_fall_raw = False
 _fall_raw_state_lock = Lock()
@@ -801,6 +978,187 @@ def _update_temperature(temp_value):
             _current_temperature = numeric
 
 
+def _build_stable_health_packet(raw_payload: dict, source_topic: str) -> dict:
+    global _ema_bpm
+    global _ema_spo2
+    global _latest_hr
+    global _latest_spo2
+
+    quality = raw_payload.get("quality", {})
+    quality_valid = _quality_is_valid(quality)
+    quality_confidence = _quality_confidence(quality)
+    signal_usable = _ppg_signal_is_usable(quality)
+    quality_status = quality.get("status", "unknown") if isinstance(quality, dict) else "unknown"
+
+    data = raw_payload.get("data", [])
+    temp = raw_payload.get("temp")
+    bpm_ppg = None
+    spo2 = None
+    fallback_bpm = None
+    bpm_source = "missing"
+    samples = []
+
+    if not quality_valid:
+        print(f"Signal quality bad: {quality_status} - using recent valid values only")
+    elif not signal_usable:
+        print(f"PPG signal weak despite valid quality: {quality_status} - using recent valid values only")
+    elif not isinstance(data, list):
+        print("PPG data is not a JSON array - using recent valid values only")
+        data = []
+    else:
+        try:
+            step_size = int(raw_payload.get("step_size", _PPG_STEP_SIZE) or _PPG_STEP_SIZE)
+        except (TypeError, ValueError):
+            step_size = _PPG_STEP_SIZE
+
+        min_required_samples = min(max(80, step_size // 2), step_size)
+        if len(data) < min_required_samples:
+            print(f"Not enough PPG samples: {len(data)}/{min_required_samples}")
+        else:
+            for sample in data:
+                if not isinstance(sample, dict):
+                    continue
+                t = sample.get("t") if "t" in sample else sample.get("ts")
+                ir = sample.get("ir")
+                red = sample.get("red")
+
+                if t is None or ir is None or red is None:
+                    continue
+
+                try:
+                    samples.append({
+                        "t": int(t),
+                        "ir": int(ir),
+                        "red": int(red),
+                    })
+                except (TypeError, ValueError):
+                    continue
+
+            if len(samples) < min_required_samples:
+                print(f"Not enough valid PPG samples: {len(samples)}/{min_required_samples}")
+            else:
+                fallback_bpm = calculate_bpm_from_samples(samples)
+
+                try:
+                    normalized_ppg = _normalize_raw_payload_for_api(raw_payload)
+                    model_samples = from_json_samples(json.dumps(normalized_ppg))
+
+                    if model_samples:
+                        latest_sample = model_samples[-1]
+
+                        if _is_valid_vital_value("heart_rate", getattr(latest_sample, "heart_rate", None)):
+                            bpm_ppg = float(latest_sample.heart_rate)
+
+                        if _is_valid_vital_value("spo2", getattr(latest_sample, "spo2", None)):
+                            spo2 = float(latest_sample.spo2)
+
+                        if _is_valid_vital_value("temp", getattr(latest_sample, "temp", None)):
+                            temp = float(latest_sample.temp)
+
+                except Exception as exc:
+                    print(f"SpO2/BPM calculation error: {exc}")
+
+                bpm_ppg, bpm_source = _choose_bpm_estimate(bpm_ppg, fallback_bpm)
+
+    bpm_raw = bpm_ppg
+    spo2_raw = spo2
+    now_mono = time.monotonic()
+
+    with _ema_lock:
+        bpm_ppg, _ema_bpm, bpm_stale, bpm_updated, bpm_stable_input = _smooth_vital_value(
+            key="heart_rate",
+            raw_value=bpm_ppg,
+            ema_value=_ema_bpm,
+            recent_values=_recent_bpm_values,
+            base_alpha=EMA_ALPHA_BPM,
+            confidence=quality_confidence,
+            jump_threshold=18.0,
+            max_delta_per_update=3.0,
+            decimals=1,
+            now_mono=now_mono,
+        )
+        if bpm_updated:
+            _last_valid_vitals["heart_rate"] = bpm_ppg
+            _last_valid_vital_times["heart_rate"] = now_mono
+
+        spo2, _ema_spo2, spo2_stale, spo2_updated, spo2_stable_input = _smooth_vital_value(
+            key="spo2",
+            raw_value=spo2,
+            ema_value=_ema_spo2,
+            recent_values=_recent_spo2_values,
+            base_alpha=EMA_ALPHA_SPO2,
+            confidence=quality_confidence,
+            jump_threshold=2.5,
+            max_delta_per_update=0.6,
+            decimals=1,
+            now_mono=now_mono,
+        )
+        if spo2_updated:
+            _last_valid_vitals["spo2"] = spo2
+            _last_valid_vital_times["spo2"] = now_mono
+
+        if _is_valid_vital_value("temp", temp):
+            temp_raw = round(float(temp), 2)
+            _recent_temp_values.append(temp_raw)
+            temp_avg = _last_average(_recent_temp_values)
+            temp = round(temp_avg if temp_avg is not None else temp_raw, 2)
+            temp_stale = False
+            _last_valid_vitals["temp"] = temp
+            _last_valid_vital_times["temp"] = now_mono
+        else:
+            temp, temp_stale = _get_recent_valid_value("temp", now_mono)
+
+        ema_bpm = round(_ema_bpm, 1) if _ema_bpm is not None else None
+        ema_spo2 = round(_ema_spo2, 1) if _ema_spo2 is not None else None
+
+    _update_temperature(temp)
+
+    with _latest_vitals_lock:
+        if bpm_ppg is not None:
+            _latest_hr = bpm_ppg
+        if spo2 is not None:
+            _latest_spo2 = spo2
+
+    last_sample_ts = None
+    if isinstance(data, list) and data and isinstance(data[-1], dict):
+        last_sample_ts = data[-1].get("t", data[-1].get("ts"))
+    ts = raw_payload.get("ts") or raw_payload.get("timestamp") or last_sample_ts
+    status = classify(bpm_ppg, temp, spo2)
+
+    print(
+        f"Vitals BPM={bpm_ppg} raw={bpm_raw} stable={bpm_stable_input} "
+        f"SpO2={spo2} raw={spo2_raw} Temp={temp} "
+        f"EMA_BPM={ema_bpm} EMA_SpO2={ema_spo2} conf={quality_confidence:.2f} src={bpm_source}"
+    )
+
+    return {
+        "type": "health_update",
+        "source_topic": source_topic,
+        "server_timestamp": int(time.time()),
+        "data": {
+            "ts": ts,
+            "bpm": bpm_ppg,
+            "spo2": spo2,
+            "temp": temp,
+            "status": status,
+            "bpm_raw": bpm_raw,
+            "spo2_raw": spo2_raw,
+            "bpm_fallback_raw": fallback_bpm,
+            "bpm_source": bpm_source,
+            "bpm_stable_input": bpm_stable_input,
+            "spo2_stable_input": spo2_stable_input,
+            "confidence": quality_confidence,
+            "signal_usable": signal_usable,
+            "stale": {
+                "bpm": bpm_stale,
+                "spo2": spo2_stale,
+                "temp": temp_stale,
+            },
+            "quality": raw_payload.get("quality", {}),
+        },
+    }
+
+
 # ====== CALLBACK ======
 def on_connect(client, userdata, flags, reason_code, properties=None):
     global _mqtt_connected
@@ -905,207 +1263,16 @@ def on_message(client, userdata, msg):
         except json.JSONDecodeError as exc:
             raise ValueError("Payload JSON khong hop le") from exc
 
-        # ==== PPG BPM CALCULATION LOGIC ====
-        # ==== PPG BPM CALCULATION LOGIC ====
-
-        quality = raw_payload.get("quality", {})
-
-        if not (
-            isinstance(quality, dict)
-            and quality.get("valid", True)
-        ):
-            print(
-                f"⚠️ Signal quality xấu: "
-                f"{quality.get('status', 'unknown')} - bỏ qua"
-            )
-            return
-
-
-        # ─────────────────────────────────────────────
-        # Lấy data PPG
-        # ─────────────────────────────────────────────
-
-        step_size = raw_payload.get("step_size", _PPG_STEP_SIZE)
-
-        data = raw_payload.get("data", [])
-
-        if not isinstance(data, list) or len(data) < step_size:
-            print("⚠️ Không đủ data hoặc step_size")
-            return
-
-
-        samples = []
-
-        for sample in data:
-
-            t = sample.get("t") or sample.get("ts")
-            ir = sample.get("ir")
-            red = sample.get("red")
-
-            if t is None or ir is None or red is None:
-                continue
-
-            samples.append({
-                "t": int(t),
-                "ir": int(ir),
-                "red": int(red),
-            })
-
-
-        # ─────────────────────────────────────────────
-        # BPM từ PPG
-        # ─────────────────────────────────────────────
-
-        bpm_ppg = calculate_bpm_from_samples(samples)
-
-        temp = raw_payload.get("temp")
-
-
-        # ─────────────────────────────────────────────
-        # Tính SpO2 từ model
-        # ─────────────────────────────────────────────
-
-        spo2 = None
-
-        try:
-
-            normalized_ppg = _normalize_raw_payload_for_api(
-                raw_payload
-            )
-
-            model_samples = from_json_samples(
-                json.dumps(normalized_ppg)
-            )
-
-            if model_samples:
-                latest_sample = model_samples[-1]
-
-                if _is_valid_vital_value(
-                    "heart_rate",
-                    getattr(latest_sample, "heart_rate", None),
-                ):
-                    bpm_ppg = float(latest_sample.heart_rate)
-
-                if _is_valid_vital_value(
-                    "spo2",
-                    getattr(latest_sample, "spo2", None),
-                ):
-                    spo2 = float(latest_sample.spo2)
-
-                if _is_valid_vital_value(
-                    "temp",
-                    getattr(latest_sample, "temp", None),
-                ):
-                    temp = float(latest_sample.temp)
-
-        except Exception as exc:
-            print(f"⚠️ SpO2 calculation error: {exc}")
-
-            
-        global _ema_bpm
-        global _ema_spo2
-        global _latest_hr
-        global _latest_spo2
-        global _last_valid_vitals
-
-        bpm_raw = bpm_ppg
-        spo2_raw = spo2
-
-        with _ema_lock:
-            if bpm_ppg is not None:
-
-                raw_bpm = round(bpm_ppg, 1)
-
-                # EMA smoothing
-                _ema_bpm = _apply_ema(
-                    current_value=raw_bpm,
-                    ema_value=_ema_bpm,
-                    alpha=EMA_ALPHA_BPM,
-                )
-
-                ema_bpm = round(_ema_bpm, 1)
-
-                # Ưu tiên giá trị đã làm mượt để giữ ổn định giữa các batch
-                bpm_ppg = ema_bpm
-                _last_valid_vitals["heart_rate"] = ema_bpm
-            else:
-
-                # Nếu detect fail -> giữ giá trị cũ
-                bpm_ppg = _last_valid_vitals["heart_rate"]
-
-
-            # =====================================================
-            # SpO2
-            # =====================================================
-
-            if spo2 is not None:
-
-                # EMA
-                _ema_spo2 = _apply_ema(
-                    current_value=spo2,
-                    ema_value=_ema_spo2,
-                    alpha=EMA_ALPHA_SPO2,
-                )
-
-                spo2 = round(_ema_spo2, 1)
-
-                # Lưu latest valid
-                _last_valid_vitals["spo2"] = spo2
-
-            else:
-
-                # Giữ giá trị SpO2 cũ
-                spo2 = _last_valid_vitals["spo2"]
-
-
-            # =====================================================
-            # TEMP
-            # =====================================================
-
-            if temp is not None:
-                _last_valid_vitals["temp"] = temp
-            else:
-                temp = _last_valid_vitals["temp"]
-
-        # ─────────────────────────────────────────────
-        # Update latest vitals cho fall model
-        # ─────────────────────────────────────────────
-
-        with _latest_vitals_lock:
-            if bpm_ppg is not None:
-                _latest_hr = bpm_ppg
-
-            if spo2 is not None:
-                _latest_spo2 = spo2
-
-
-            print(
-            f"💚 BPM={bpm_ppg} | "
-            f"EMA BPM={ema_bpm} | "
-            f"EMA SpO2={spo2}"
-)
-        ts = raw_payload.get("ts") or (data[-1]["t"] if data else None)
-        status = classify(bpm_ppg, temp, spo2)
-        packet = {
-            "type": "health_update",
-            "source_topic": msg.topic,
-            "server_timestamp": int(time.time()),
-            "data": {
-                "ts": ts,
-                "bpm": bpm_ppg,
-                "spo2": spo2,
-                "temp": temp,
-                "status": status,
-                "bpm_raw": bpm_raw,
-                "spo2_raw": spo2_raw,
-                "quality": raw_payload.get("quality", {}),
-            }
-        }
+        packet = _build_stable_health_packet(raw_payload, msg.topic)
         with _packet_lock:
             _latest_health_packet = packet
         _append_history(packet)
         _emit_health(packet, delay_ms=WS_HEALTH_EMIT_DELAY_MS)
-        print(f"💓 [HEALTH_UPDATE] BPM={packet['data']['bpm']} SpO2={packet['data']['spo2']} Temp={packet['data']['temp']}")
+        print(
+            f"HEALTH_UPDATE BPM={packet['data']['bpm']} "
+            f"SpO2={packet['data']['spo2']} Temp={packet['data']['temp']}"
+        )
+        return
 
     except ValueError as exc:
         print("❌ Payload khong hop le:", exc)

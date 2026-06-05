@@ -4,9 +4,16 @@ Test script để tính SpO2 từ PPG window payload.
 """
 
 import json
+import math
 import sys
 import time
 from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -303,6 +310,64 @@ test_payload = {
         {"t": 66145, "ir": 122435, "red": 101104},
     ]
 }
+
+def make_current_firmware_payload(sample_count=400, fs=50, bpm=72.0, temp=36.8):
+    dt_ms = int(round(1000.0 / fs))
+    start_ts = 100000
+    ir_dc = 120000.0
+    red_dc = 100000.0
+    ir_ac = 1800.0
+    target_ratio = 0.56
+    red_ac = red_dc * target_ratio * (ir_ac / ir_dc)
+    samples = []
+
+    for i in range(sample_count):
+        seconds = i / float(fs)
+        phase = 2.0 * math.pi * (bpm / 60.0) * seconds
+        ir = ir_dc + ir_ac * math.sin(phase) + 120.0 * math.sin(2.0 * phase)
+        red = red_dc + red_ac * math.sin(phase + 0.03) + 80.0 * math.sin(2.0 * phase)
+        samples.append({
+            "t": start_ts + i * dt_ms,
+            "ir": int(round(ir)),
+            "red": int(round(red)),
+            "v": 1,
+        })
+
+    ir_values = [item["ir"] for item in samples]
+    red_values = [item["red"] for item in samples]
+    ir_mean = sum(ir_values) / len(ir_values)
+    red_mean = sum(red_values) / len(red_values)
+    ir_p2p = max(ir_values) - min(ir_values)
+    red_p2p = max(red_values) - min(red_values)
+
+    return {
+        "type": "ppg_window",
+        "fs": fs,
+        "fs_nominal": fs,
+        "window_size": sample_count,
+        "step_size": 200,
+        "seq": 1,
+        "temp": temp,
+        "posture": "stable",
+        "az": 1.0,
+        "theta": 0.0,
+        "quality": {
+            "status": "GOOD",
+            "valid": True,
+            "ir_mean": round(ir_mean),
+            "red_mean": round(red_mean),
+            "ir_p2p": ir_p2p,
+            "red_p2p": red_p2p,
+            "ir_acdc": ir_p2p / ir_mean,
+            "red_acdc": red_p2p / red_mean,
+            "max_jerk": 0.4,
+            "bad_motion_rate": 0.0,
+        },
+        "data": samples,
+    }
+
+
+test_payload = make_current_firmware_payload()
 
 
 def main():

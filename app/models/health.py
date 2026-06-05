@@ -131,11 +131,12 @@ def _first_batch_list_length(payload: Dict[str, Any], keys: List[str]) -> int | 
     return None
 
 
-def _is_valid_vital(value: Any) -> bool:
+def _is_valid_vital(value: Any, low: float = 0.0, high: float = float("inf")) -> bool:
     if value is None:
         return False
     try:
-        return float(value) >= 0.0
+        numeric = float(value)
+        return low <= numeric <= high
     except (TypeError, ValueError):
         return False
 
@@ -214,8 +215,12 @@ def _split_contiguous_valid_segments(values: List[int] | None, min_valid_value: 
 def _remove_dc(signal: np.ndarray, window_size: int) -> np.ndarray:
     if window_size < 2 or signal.size == 0:
         return signal - float(np.mean(signal))
+    window_size = min(int(window_size), int(signal.size))
     kernel = np.ones(window_size, dtype=np.float64) / float(window_size)
-    baseline = np.convolve(signal, kernel, mode="same")
+    pad_left = window_size // 2
+    pad_right = window_size - 1 - pad_left
+    padded = np.pad(signal, (pad_left, pad_right), mode="edge")
+    baseline = np.convolve(padded, kernel, mode="valid")
     return signal - baseline
 
 
@@ -227,6 +232,48 @@ def _bandpass_fft(signal: np.ndarray, sample_rate_hz: float, low_hz: float, high
     mask = (freqs >= low_hz) & (freqs <= high_hz)
     spectrum[~mask] = 0
     return np.fft.irfft(spectrum, n=signal.size)
+
+
+def _local_autocorr_peak(corr: np.ndarray, target_lag: int, radius: int = 3) -> tuple[int, float] | None:
+    if target_lag <= 0 or target_lag >= corr.size:
+        return None
+    start = max(1, target_lag - radius)
+    end = min(corr.size - 1, target_lag + radius)
+    if end < start:
+        return None
+    segment = corr[start:end + 1]
+    offset = int(np.argmax(segment))
+    lag = start + offset
+    return lag, float(corr[lag])
+
+
+def _apply_bpm_harmonic_guard(bpm: float, filtered: np.ndarray, sample_rate_hz: float) -> float:
+    if bpm < 98.0 or filtered.size < int(sample_rate_hz * 4):
+        return bpm
+
+    x = filtered - float(np.mean(filtered))
+    std = float(np.std(x))
+    if std <= 1e-6:
+        return bpm
+
+    corr = np.correlate(x, x, mode="full")[x.size - 1:]
+    if corr.size == 0 or corr[0] <= 1e-9:
+        return bpm
+    corr = corr / corr[0]
+
+    main_lag = int(round(60.0 * sample_rate_hz / bpm))
+    main_peak = _local_autocorr_peak(corr, main_lag)
+    half_peak = _local_autocorr_peak(corr, main_lag * 2, radius=5)
+    if main_peak is None or half_peak is None:
+        return bpm
+
+    half_lag, half_score = half_peak
+    _, main_score = main_peak
+    half_bpm = 60.0 * sample_rate_hz / float(half_lag)
+
+    if 45.0 <= half_bpm <= 85.0 and half_score >= 0.45 and half_score >= main_score * 0.55:
+        return half_bpm
+    return bpm
 
 
 def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> float | None:
@@ -260,7 +307,7 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
     sample_rate_hz = _sample_rate_hz(sample_interval_ms)
     dc_window = max(2, int(sample_rate_hz * 0.5))
     centered = _remove_dc(signal, dc_window)
-    filtered = _bandpass_fft(centered, sample_rate_hz, 0.5, 4.0)
+    filtered = _bandpass_fft(centered, sample_rate_hz, 0.5, 3.0)
 
     filtered_std = float(np.std(filtered))
     if filtered_std <= 1e-6:
@@ -295,7 +342,12 @@ def _estimate_bpm_from_ir(ir_values: List[int], sample_interval_ms: int) -> floa
         return None
 
     bpm = 60.0 / float(np.median(rr_seconds))
+    bpm = _apply_bpm_harmonic_guard(bpm, filtered, sample_rate_hz)
     return float(np.clip(bpm, MIN_BPM, MAX_BPM))
+
+
+def estimate_bpm_from_ppg_values(ir_values: List[int], sample_interval_ms: int) -> float | None:
+    return _estimate_bpm_from_ir(ir_values, sample_interval_ms)
 
 
 def _estimate_spo2_from_ir_red(
@@ -365,8 +417,12 @@ def _estimate_spo2_from_ir_red(
     # Ratio: (AC_red/DC_red) / (AC_ir/DC_ir)
     ratio = (red_ac / red_dc) / (ir_ac / ir_dc)
 
-    # SpO₂ formula
-    spo2 = 120.0 - 25.0 * ratio
+    if ratio < 0.15 or ratio > 1.8:
+        return None
+
+    # Empirical MAX3010x ratio-of-ratios calibration. This avoids the old
+    # linear formula over-reporting and clipping normal finger data to 100%.
+    spo2 = -45.060 * ratio * ratio + 30.354 * ratio + 94.845
     return float(np.clip(spo2, MIN_SPO2, MAX_SPO2))
 
 
@@ -516,7 +572,7 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
         marked_red_series = [v if (v is not None and int(v) > 0) else None for v in raw_red_series]
 
     heart_rate: float | None = None
-    if _is_valid_vital(normalized.get("heart_rate")):
+    if _is_valid_vital(normalized.get("heart_rate"), MIN_BPM, MAX_BPM):
         heart_rate = _to_float(normalized["heart_rate"], "heart_rate")
     elif marked_ir_series is not None:
         heart_rate = _estimate_bpm_from_ir(marked_ir_series, sample_interval_ms)
@@ -524,7 +580,7 @@ def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     # preserve None if heart rate estimation failed so callers can display empty/missing value
 
     spo2_value: float | None = None
-    if _is_valid_vital(normalized.get("spo2")):
+    if _is_valid_vital(normalized.get("spo2"), MIN_SPO2, MAX_SPO2):
         spo2_value = _to_float(normalized["spo2"], "spo2")
     elif marked_ir_series is not None and marked_red_series is not None:
         spo2_value = _estimate_spo2_from_ir_red(marked_ir_series, marked_red_series, sample_interval_ms)
@@ -616,11 +672,12 @@ def from_json_samples(raw: str) -> List[HealthData]:
 def classify(bpm, temp, spo2) -> List[str]:
     statuses = []
 
-    if temp < TEMP_LOW_THRESHOLD:
-        statuses.append(STATUS_LOW_TEMP)
+    if temp is not None:
+        if temp < TEMP_LOW_THRESHOLD:
+            statuses.append(STATUS_LOW_TEMP)
 
-    if temp > TEMP_FEVER_THRESHOLD:
-        statuses.append(STATUS_FEVER)
+        if temp > TEMP_FEVER_THRESHOLD:
+            statuses.append(STATUS_FEVER)
 
     if bpm is not None:
         if bpm < BPM_LOW_THRESHOLD:
