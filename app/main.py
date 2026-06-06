@@ -509,6 +509,11 @@ def _build_fall_packet(fall_result: dict, source_topic: str = "sensor/fall_raw")
         "fall": {
             "detected": fall_result.get("detected", False),
             "confidence": fall_result.get("confidence", 0.0),
+            "num_samples": fall_result.get("num_samples"),
+            "window_size": fall_result.get("window_size"),
+            "pre_samples": fall_result.get("pre_samples"),
+            "reason": fall_result.get("reason"),
+            "status": fall_result.get("status", "model_result"),
         },
     }
 
@@ -752,8 +757,19 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
         if raw6.shape[0] < window_size:
             print(
                 f"fall_raw ngan hon window model: {raw6.shape[0]}/{window_size} samples, "
-                "model se pad window"
+                "khong chay model de tranh du doan sai"
             )
+            return {
+                'detected': False,
+                'confidence': 0.0,
+                'num_samples': num_samples,
+                'window_size': window_size,
+                'pre_samples': pre_samples,
+                'trigger_ts': trigger_ts,
+                'reason': f"insufficient_samples:{reason}",
+                'alert_trigger': "fall_raw_insufficient_samples",
+                'status': "insufficient_samples",
+            }
 
         def _select_window(raw6_window: np.ndarray, center_idx, size: int) -> np.ndarray:
             if raw6_window.shape[0] <= size:
@@ -804,10 +820,12 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
             'detected': detected,
             'confidence': round(confidence, 3),
             'num_samples': num_samples,
+            'window_size': window_size,
             'pre_samples': pre_samples,
             'trigger_ts': trigger_ts,
             'reason': reason,
             'alert_trigger': alert_trigger,
+            'status': "model_result",
         }
 
     except Exception as e:

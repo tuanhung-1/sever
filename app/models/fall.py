@@ -124,7 +124,7 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
             )
         )
         self._model_file = model_file
-        self._threshold = float(threshold if threshold is not None else self.metadata.get("threshold", 0.9))
+        self._threshold = float(threshold if threshold is not None else self.metadata.get("threshold", 0.8))
         self._post_filter = dict(self.metadata.get("post_filter") or {})
 
         self._mean = self._load_vector("fall_cnn_mean.npy")
