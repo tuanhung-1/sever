@@ -2,6 +2,8 @@ try:
     import paho.mqtt.client as mqtt
 except ModuleNotFoundError:
     mqtt = None
+import csv
+import io
 import ssl
 import certifi
 import time
@@ -13,7 +15,7 @@ from collections import deque
 
 import numpy as np
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 from app.core.config import settings
 from app.core.extensions import socketio
@@ -55,6 +57,10 @@ API_BIND_HOST = settings.api_bind_host
 API_ACCESS_HOST = settings.api_access_host
 HISTORY_FILE = settings.history_file
 FALL_HISTORY_FILE = settings.fall_history_file
+TRAINING_FALL_RAW_FILE = "storage/training/fall_raw_windows.jsonl"
+TRAINING_FALL_RAW_CSV_FILE = "storage/training/fall_raw_training_windows.csv"
+FALL_TRAINING_EXPORT_ENABLED = True
+VALID_TRAINING_LABELS = {"fall", "not_fall"}
 API_VERBOSE_OUTPUT = settings.api_verbose_output
 
 
@@ -391,6 +397,8 @@ def _choose_bpm_estimate(primary_bpm, fallback_bpm):
 # ── Trạng thái luồng Fall_Raw ────────────────────────────────────────────────
 _waiting_for_fall_raw = False
 _fall_raw_state_lock = Lock()
+_pending_training_label = None
+_pending_training_label_lock = Lock()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -639,6 +647,160 @@ def _read_fall_history(limit: int = 50) -> list:
     """Đọc lịch sử fall_update từ FALL_HISTORY_FILE, mới nhất trước."""
     return read_jsonl_records(FALL_HISTORY_FILE, limit=limit, lock=_history_lock)
 
+
+def _make_training_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time() * 1000)}"
+
+
+def _normalize_training_label(label) -> str:
+    normalized = str(label or "").strip().lower()
+    if normalized not in VALID_TRAINING_LABELS:
+        raise ValueError("label chi duoc la 'fall' hoac 'not_fall'")
+    return normalized
+
+
+def _set_pending_training_label(label: str) -> str:
+    normalized = _normalize_training_label(label)
+    global _pending_training_label
+    with _pending_training_label_lock:
+        _pending_training_label = normalized
+    return normalized
+
+
+def _consume_pending_training_label() -> str | None:
+    global _pending_training_label
+    with _pending_training_label_lock:
+        label = _pending_training_label
+        _pending_training_label = None
+    return label
+
+
+def _append_fall_raw_training_window(decoded_data: dict, result: dict | None = None) -> None:
+    samples = decoded_data.get("data")
+    if isinstance(samples, np.ndarray):
+        samples = samples.astype(float).tolist()
+
+    training_id = _make_training_id("fall")
+    label = _consume_pending_training_label()
+    record = {
+        "training_id": training_id,
+        "source_topic": "sensor/fall_raw",
+        "received_at": int(time.time()),
+        "trigger_ts": decoded_data.get("trigger_ts"),
+        "num_samples": decoded_data.get("num_samples"),
+        "pre_samples": decoded_data.get("pre_samples"),
+        "reason": decoded_data.get("reason"),
+        "data": samples,
+        "model_result": result or {},
+        "label": label,
+    }
+    append_jsonl_record(TRAINING_FALL_RAW_FILE, record, lock=_history_lock)
+    return training_id
+
+
+def _read_training_records(file_path: str) -> list[dict]:
+    return read_jsonl_records(file_path, limit=1_000_000, lock=_history_lock)[::-1]
+
+
+def _write_training_records(file_path: str, records: list[dict]) -> None:
+    import os
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with _history_lock:
+        with open(file_path, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _label_training_record(training_id: str, label: str) -> dict | None:
+    normalized = _normalize_training_label(label)
+    records = _read_training_records(TRAINING_FALL_RAW_FILE)
+    updated = None
+
+    for record in records:
+        if record.get("training_id") == training_id:
+            record["label"] = normalized
+            record["label_updated_at"] = int(time.time())
+            updated = record
+            break
+
+    if updated is None:
+        return None
+
+    _write_training_records(TRAINING_FALL_RAW_FILE, records)
+    _save_fall_training_csv_file(records)
+    return updated
+
+
+def _label_latest_training_record(label: str) -> dict | None:
+    records = _read_training_records(TRAINING_FALL_RAW_FILE)
+    if not records:
+        return None
+    latest = records[-1]
+    return _label_training_record(str(latest.get("training_id")), label)
+
+
+def _csv_response(rows: list[dict], filename: str) -> Response:
+    output = io.StringIO()
+    if rows:
+        fieldnames = list(rows[0].keys())
+        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _flatten_fall_training_rows(records: list[dict]) -> list[dict]:
+    rows = []
+    for record in records:
+        samples = record.get("data") or []
+        result = record.get("model_result") or {}
+        pre_samples = int(record.get("pre_samples") or 0)
+        for idx, sample in enumerate(samples):
+            values = list(sample) if isinstance(sample, (list, tuple)) else []
+            values = (values + [None] * 8)[:8]
+            rows.append({
+                "training_id": record.get("training_id"),
+                "saved_at": record.get("saved_at"),
+                "trigger_ts": record.get("trigger_ts"),
+                "sample_index": idx,
+                "relative_index": idx - pre_samples,
+                "is_pre_trigger": idx < pre_samples,
+                "label": record.get("label"),
+                "model_detected": result.get("detected"),
+                "model_confidence": result.get("confidence"),
+                "reason": record.get("reason"),
+                "ax": values[0],
+                "ay": values[1],
+                "az": values[2],
+                "gx": values[3],
+                "gy": values[4],
+                "gz": values[5],
+                "acc_mag": values[6],
+                "jerk": values[7],
+            })
+    return rows
+
+def _save_fall_training_csv_file(records: list[dict]) -> None:
+    rows = _flatten_fall_training_rows(records)
+
+    if not rows:
+        return
+
+    import os
+    os.makedirs(os.path.dirname(TRAINING_FALL_RAW_CSV_FILE), exist_ok=True)
+
+    with open(TRAINING_FALL_RAW_CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        fieldnames = list(rows[0].keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"✅ Da luu file CSV: {TRAINING_FALL_RAW_CSV_FILE}")
 
 def _to_number(value):
     try:
@@ -1233,6 +1395,11 @@ def on_message(client, userdata, msg):
 
                 print(f"🧠 [MODEL] Đang xử lý {decoded['num_samples']} motion samples...")
                 result = _process_fall_raw_with_model(decoded, pending_alert)
+                training_id = _append_fall_raw_training_window(decoded, result)
+                print(f"[TRAINING] Saved window: {training_id}")
+
+                records = _read_training_records(TRAINING_FALL_RAW_FILE)
+                _save_fall_training_csv_file(records)
 
                 if result:
                     if result['detected']:
@@ -1512,6 +1679,16 @@ def get_api_docs():
                     "description": "Lich su ket hop health_update va fall_update. ?limit=1..1000 | ?type=all|health|fall",
                     "response": "{ count, items: [{ saved_at, type, source_topic, server_timestamp, ...data_or_fall }] }",
                 },
+                {
+                    "method": "GET",
+                    "path": "/api/training",
+                    "description": "Thong ke du lieu fall_raw da thu de train tiep.",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/training/fall.csv",
+                    "description": "Tai CSV du lieu te nga da qua filter .ino.",
+                },
             ],
             "websocket": {
                 "transport": "Socket.IO",
@@ -1626,6 +1803,34 @@ def get_history():
         items = merged[:limit]
 
     return jsonify({"count": len(items), "items": items})
+
+
+@app.get("/api/training")
+def get_training_summary():
+    if not FALL_TRAINING_EXPORT_ENABLED:
+        return jsonify({"message": "Fall training export da bi khoa"}), 403
+
+    fall_records = _read_training_records(TRAINING_FALL_RAW_FILE)
+    return jsonify(
+        {
+            "fall_raw_windows": len(fall_records),
+            "csv": {
+                "fall": "/api/training/fall.csv",
+            },
+            "storage": {
+                "fall_jsonl": TRAINING_FALL_RAW_FILE,
+            },
+        }
+    )
+
+
+@app.get("/api/training/fall.csv")
+def export_fall_training_csv():
+    if not FALL_TRAINING_EXPORT_ENABLED:
+        return jsonify({"message": "Fall training export da bi khoa"}), 403
+
+    records = _read_training_records(TRAINING_FALL_RAW_FILE)
+    return _csv_response(_flatten_fall_training_rows(records), "fall_raw_training_windows.csv")
 
 
 def main():

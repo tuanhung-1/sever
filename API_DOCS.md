@@ -15,6 +15,12 @@ Base URL local:
     - `type`: `all | health | fall`, default `all`
   - Returns saved health and fall update history from `storage/history/`.
 
+- `GET /api/training`
+  - Returns counts for collected fall raw training windows.
+
+- `GET /api/training/fall.csv`
+  - Downloads flattened CSV for fall training data collected after the ESP32 `.ino` filter.
+
 ## AI Model
 
 Fall detection uses the trained multi-stage gated 1D CNN artifacts in:

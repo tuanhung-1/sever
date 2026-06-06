@@ -14,7 +14,7 @@ venv/
 
 # Runtime data
 storage/
-
+kfall/
 # OS
 .DS_Store
 
