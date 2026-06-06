@@ -10,13 +10,24 @@
 #include <string>
 #include "secrets.h"
 
+#define DATA_COLLECTION_MODE 1
+
+#if DATA_COLLECTION_MODE
+#define DELTA_G_THRESHOLD   0.65f
+#define PEAK_G_INSTANT      2.5f
+#define FALL_COOLDOWN_MS    2200
+#define COLLECTION_CAPTURE_ALL_TRANSITIONS 1
+#else
 #define DELTA_G_THRESHOLD   0.9f
+#define PEAK_G_INSTANT      3.0f
+#define FALL_COOLDOWN_MS    5000
+#define COLLECTION_CAPTURE_ALL_TRANSITIONS 0
+#endif
+
 #define DELTA_G_WINDOW_MS   150
 #define CONFIRM_WAIT_MS     250
 #define AZ_FALLEN_THRESH    0.6f
 #define AZ_NORMAL_RECOVERY  0.65f
-#define PEAK_G_INSTANT      3.0f
-#define FALL_COOLDOWN_MS    5000
 
 #define FILTER_GPEAK_MIN      1.6f
 #define FILTER_DTHETA_MIN_DEG 35.0f
@@ -85,6 +96,8 @@
 
 #define TEMP_EMA_ALPHA   0.07f
 #define TEMP_SKIN_OFFSET 1.5f
+#define MPU_INVALID_G_MIN 0.20f
+#define MPU_INVALID_LOG_MS 1000
 
 static uint8_t binaryBuf[BINARY_BUF_SIZE];
 
@@ -154,6 +167,8 @@ bool          tempInitialized = false;
 unsigned long lastTempRead   = 0;
 unsigned long lastSample     = 0;
 unsigned long lastLog        = 0;
+unsigned long lastMpuInvalidLog = 0;
+uint32_t      mpuInvalidCount = 0;
 bool          buzzerOn       = false;
 unsigned long buzzerTimer    = 0;
 int           buzzerDuration = 0;
@@ -212,6 +227,20 @@ inline int16_t floatToI16(float v, float scale) {
 inline float calcTheta(float ax, float ay, float az) {
   float lateral = sqrtf(ax * ax + ay * ay);
   return degrees(atan2f(lateral, fabsf(az)));
+}
+
+bool isValidMotionSample(float ax, float ay, float az, float gx, float gy, float gz, float mag) {
+  if (isnan(ax) || isnan(ay) || isnan(az) || isnan(gx) || isnan(gy) || isnan(gz) || isnan(mag)) {
+    return false;
+  }
+  if (mag < MPU_INVALID_G_MIN) {
+    return false;
+  }
+  if (fabsf(ax) < 0.001f && fabsf(ay) < 0.001f && fabsf(az) < 0.001f &&
+      fabsf(gx) < 0.001f && fabsf(gy) < 0.001f && fabsf(gz) < 0.001f) {
+    return false;
+  }
+  return true;
 }
 
 float median(float* arr, int n) {
@@ -643,7 +672,14 @@ void sendRejectAlert(const char* rejectReason, float peakG) {
 
 void sendFallBinary() {
   char filterLog[384] = "";
+#if DATA_COLLECTION_MODE
+  bool passed = true;
+  snprintf(filterLog, sizeof(filterLog),
+           "COLLECTION_PASS: peak=%.2fg delta=%.2fg trigger=%s",
+           transitionPeakG, transitionDeltaG, triggerReason);
+#else
   bool passed = preAIFilter(peakWriteIdx, transitionPeakG, filterLog, sizeof(filterLog));
+#endif
   if (!passed) {
     filterRejectCount++;
     Serial.printf("[FILTER] %s | Tong reject: %lu\n", filterLog, (unsigned long)filterRejectCount);
@@ -858,11 +894,13 @@ void updateStateMachine(float totalG, float az, unsigned long now) {
       bool jumpLandingLike = transitionPeakG >= 1.8f && transitionPeakG <= 3.4f &&
                              maxGyroRecent < 300.0f && thetaSwingRecent < 30.0f && uprightAfter && !freeFallDetected;
 
+#if !DATA_COLLECTION_MODE
       if (stairLike || stepUpDownLike || jumpLandingLike) {
         Serial.printf("[FSM] ADL reject: peak=%.2f |az|=%.2f -> STABLE.\n", transitionPeakG, azAbs);
         currentState = STATE_STABLE; memset(triggerReason, 0, sizeof(triggerReason));
         break;
       }
+#endif
 
       bool postureMaybeFall = azAbs < 0.60f || minAzRecent < 0.55f || thetaSwingRecent >= 40.0f;
       bool bodyGNormal      = totalG < 1.35f;
@@ -874,15 +912,29 @@ void updateStateMachine(float totalG, float az, unsigned long now) {
       bool chairCandidate     = transitionPeakG >= 1.8f && maxGyroRecent >= 180.0f && thetaSwingRecent >= 35.0f && minAzRecent < 0.60f && azAbs < 0.65f;
       bool slowFallCandidate  = transitionPeakG >= 1.35f && transitionPeakG < 2.2f && thetaSwingRecent >= 60.0f && maxGyroRecent >= 50.0f && maxGyroRecent <= 200.0f && minAzRecent < 0.55f && azAbs < 0.55f;
 
-      if (strongImpactFall || (mediumImpact && postureMaybeFall && bodyGNormal && rotateStrong) || chairCandidate || slowFallCandidate) {
+#if DATA_COLLECTION_MODE
+      bool collectionCandidate = transitionPeakG >= 1.45f || maxGyroRecent >= 90.0f || thetaSwingRecent >= 35.0f;
+#else
+      bool collectionCandidate = false;
+#endif
+
+      if (strongImpactFall || (mediumImpact && postureMaybeFall && bodyGNormal && rotateStrong) || chairCandidate || slowFallCandidate || collectionCandidate) {
         snprintf(triggerReason, sizeof(triggerReason),
                  "suspected_fall_peak%.2f_az%.2f_maxGyro%.1f_thetaSwing%.1f",
                  transitionPeakG, azAbs, maxGyroRecent, thetaSwingRecent);
         Serial.printf("[FSM] Nghi te! peak=%.2f -> CONFIRMING.\n", transitionPeakG);
         currentState = STATE_CONFIRMING; stateEnteredMs = now;
       } else {
+#if COLLECTION_CAPTURE_ALL_TRANSITIONS
+        snprintf(triggerReason, sizeof(triggerReason),
+                 "collection_adl_peak%.2f_az%.2f_maxGyro%.1f_thetaSwing%.1f",
+                 transitionPeakG, azAbs, maxGyroRecent, thetaSwingRecent);
+        Serial.printf("[FSM] COLLECTION capture ADL window: peak=%.2f -> CONFIRMING.\n", transitionPeakG);
+        currentState = STATE_CONFIRMING; stateEnteredMs = now;
+#else
         Serial.printf("[FSM] ADL binh thuong -> STABLE.\n");
         currentState = STATE_STABLE; memset(triggerReason, 0, sizeof(triggerReason));
+#endif
       }
       break;
     }
@@ -1011,6 +1063,24 @@ void loop() {
     s.gy    = mpu6050.getGyroY();
     s.gz    = mpu6050.getGyroZ();
     s.mag   = sqrtf(s.ax*s.ax + s.ay*s.ay + s.az*s.az);
+
+    if (!isValidMotionSample(s.ax, s.ay, s.az, s.gx, s.gy, s.gz, s.mag)) {
+      mpuInvalidCount++;
+      currentState = STATE_STABLE;
+      memset(triggerReason, 0, sizeof(triggerReason));
+      peakGInWindow = 0.0f;
+      maxDeltaG = 0.0f;
+      freeFallDetected = false;
+
+      if (millis() - lastMpuInvalidLog >= MPU_INVALID_LOG_MS) {
+        lastMpuInvalidLog = millis();
+        Serial.printf("[MPU] Invalid sample skipped: ax=%.3f ay=%.3f az=%.3f gx=%.1f gy=%.1f gz=%.1f G=%.3f total=%lu\n",
+                      s.ax, s.ay, s.az, s.gx, s.gy, s.gz, s.mag, (unsigned long)mpuInvalidCount);
+      }
+      sendSensorWindow();
+      return;
+    }
+
     s.jerk  = fabsf(s.mag - prevMag) / (SAMPLE_INTERVAL_MS / 1000.0f);
     s.theta = calcTheta(s.ax, s.ay, s.az);
     prevMag = s.mag;
