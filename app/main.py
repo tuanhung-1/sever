@@ -1869,60 +1869,6 @@ def main():
             _mqtt_client.disconnect()
 
 
-# ─── MQTT & Logging Enhancements (feature/enhance-mqtt-logging) ─────────────
-# 
-# def log_mqtt_message(topic: str, payload: str, direction: str = "rx") -> None:
-#     """
-#     Log MQTT message with timestamp and direction indicator.
-#     
-#     Args:
-#         topic: MQTT topic name
-#         payload: Message payload
-#         direction: "rx" for received, "tx" for transmitted
-#     """
-#     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-#     direction_icon = "📥" if direction == "rx" else "📤"
-#     print(f"{direction_icon} [{timestamp}] MQTT {direction.upper()}: {topic}")
-#     if API_VERBOSE_OUTPUT and payload:
-#         print(f"   Payload: {payload[:200]}...")
-
-
-# def get_mqtt_connection_status() -> Dict[str, Any]:
-#     """
-#     Get detailed MQTT connection status.
-#     
-#     Returns:
-#         Dictionary with:
-#         - is_connected: bool
-#         - broker: str
-#         - client_id: str
-#         - last_connection_time: int (unix timestamp)
-#         - connection_attempt_count: int
-#     """
-#     status = {
-#         "is_connected": _mqtt_client.is_connected() if _mqtt_client else False,
-#         "broker": BROKER,
-#         "client_id": CLIENT_ID,
-#         "mqtt_required": MQTT_REQUIRED,
-#         "topics": {
-#             "health": f"user/health",
-#             "fall": f"user/fall",
-#             "alerts": f"user/alerts"
-#         }
-#     }
-#     return status
-
-
-# def rotate_mqtt_logs(max_file_size_mb: int = 10, keep_files: int = 5) -> None:
-#     """
-#     Implement log rotation for MQTT message history.
-#     
-#     Maintains multiple log files when they exceed max_file_size_mb,
-#     keeping only the most recent keep_files log files.
-#     
-#     Useful for production to prevent disk space issues.
-#     """
-#     pass
 
 
 if __name__ == "__main__":
