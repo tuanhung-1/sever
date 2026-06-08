@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
@@ -10,6 +11,16 @@ except ModuleNotFoundError:
 
 if load_dotenv is not None:
     load_dotenv()
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _project_path(value: str) -> str:
+    path = Path(value)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return str(path.resolve())
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -119,9 +130,8 @@ settings = Settings(
     api_verbose_output=_env_bool("API_VERBOSE_OUTPUT", False),
     history_file=os.getenv("HISTORY_FILE", "storage/history/health_history.jsonl"),
     fall_history_file=os.getenv("FALL_HISTORY_FILE", "storage/history/fall_history.jsonl"),
-    fall_model_dir=os.getenv(
-        "FALL_MODEL_DIR",
-        "artifacts/fall_detection/multistage",
+    fall_model_dir=_project_path(
+        os.getenv("FALL_MODEL_DIR", "artifacts/fall_detection/multistage")
     ),
     fall_model_file=os.getenv("FALL_MODEL_FILE", "fall_v5_hybrid_deep.keras"),
     fall_model_threshold=_env_optional_float("FALL_MODEL_THRESHOLD"),

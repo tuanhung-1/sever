@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 
 try:
     import certifi
@@ -263,16 +263,33 @@ def save_window(root_dir: Path, subject: str, task: Task, decoded: dict) -> Path
     return csv_path
 
 
+
 class CollectorApp:
+    BG = "#0F172A"
+    CARD = "#111C32"
+    CARD_2 = "#16223A"
+    BORDER = "#24324D"
+    TEXT = "#E5E7EB"
+    MUTED = "#94A3B8"
+    RED = "#FB7185"
+    RED_DARK = "#9F1239"
+    GREEN = "#34D399"
+    GREEN_DARK = "#065F46"
+    BLUE = "#60A5FA"
+    AMBER = "#FBBF24"
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Fall / Not Fall Data Collector")
-        self.root.geometry("980x720")
+        self.root.title("Pulsey Data Collector")
+        self.root.geometry("1180x780")
+        self.root.minsize(1060, 700)
+        self.root.configure(bg=self.BG)
 
         self.state = CollectionState()
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.client = None
         self.connected = False
+        self.task_buttons: list[tk.Button] = []
 
         self.output_dir = tk.StringVar(value=str(Path("data")))
         self.subject = tk.StringVar(value="S01")
@@ -284,78 +301,271 @@ class CollectorApp:
         self.status_text = tk.StringVar(value="Chưa kết nối MQTT")
         self.armed_text = tk.StringVar(value="Chưa chọn task")
 
+        self._setup_style()
         self._build_ui()
         self.root.after(150, self._poll_events)
 
+    def _setup_style(self) -> None:
+        self.style = ttk.Style(self.root)
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.default_font = tkfont.Font(root=self.root, family="Segoe UI", size=10)
+        self.root.option_add("*Font", self.default_font)
+        self.style.configure("Main.TFrame", background=self.BG)
+        self.style.configure("Card.TFrame", background=self.CARD)
+        self.style.configure("Soft.TFrame", background=self.CARD_2)
+        self.style.configure("Title.TLabel", background=self.BG, foreground=self.TEXT, font=("Segoe UI", 22, "bold"))
+        self.style.configure("SubTitle.TLabel", background=self.BG, foreground=self.MUTED, font=("Segoe UI", 10))
+        self.style.configure("CardTitle.TLabel", background=self.CARD, foreground=self.TEXT, font=("Segoe UI", 12, "bold"))
+        self.style.configure("CardMuted.TLabel", background=self.CARD, foreground=self.MUTED, font=("Segoe UI", 9))
+        self.style.configure("SoftTitle.TLabel", background=self.CARD_2, foreground=self.TEXT, font=("Segoe UI", 11, "bold"))
+        self.style.configure("SoftMuted.TLabel", background=self.CARD_2, foreground=self.MUTED, font=("Segoe UI", 9))
+        self.style.configure("TLabel", background=self.CARD, foreground=self.TEXT)
+        self.style.configure(
+            "TEntry",
+            fieldbackground="#0B1220",
+            background="#0B1220",
+            foreground=self.TEXT,
+            bordercolor=self.BORDER,
+            lightcolor=self.BORDER,
+            darkcolor=self.BORDER,
+            padding=6,
+        )
+        self.style.map("TEntry", fieldbackground=[("focus", "#101A2E")])
+        self.style.configure(
+            "Primary.TButton",
+            background="#2563EB",
+            foreground="#FFFFFF",
+            borderwidth=0,
+            padding=(14, 8),
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.style.map("Primary.TButton", background=[("active", "#1D4ED8")])
+        self.style.configure(
+            "Ghost.TButton",
+            background=self.CARD_2,
+            foreground=self.TEXT,
+            borderwidth=0,
+            padding=(14, 8),
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.style.map("Ghost.TButton", background=[("active", "#1E293B")])
+        self.style.configure(
+            "Danger.TButton",
+            background="#BE123C",
+            foreground="#FFFFFF",
+            borderwidth=0,
+            padding=(14, 8),
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.style.map("Danger.TButton", background=[("active", "#9F1239")])
+
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill="both", expand=True)
+        shell = ttk.Frame(self.root, style="Main.TFrame", padding=(20, 18, 20, 16))
+        shell.pack(fill="both", expand=True)
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(2, weight=1)
 
-        config = ttk.LabelFrame(main, text="Cấu hình lưu dữ liệu và MQTT", padding=10)
-        config.pack(fill="x")
+        header = ttk.Frame(shell, style="Main.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
 
-        ttk.Label(config, text="Folder gốc:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(config, textvariable=self.output_dir, width=55).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(config, text="Chọn...", command=self.choose_output_dir).grid(row=0, column=2, padx=4)
+        ttk.Label(header, text="Pulsey Fall Dataset Collector", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Chọn task trước, thực hiện động tác, ESP32 gửi fall_raw, app tự lưu đúng một file CSV.",
+            style="SubTitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        ttk.Label(config, text="Subject:").grid(row=0, column=3, sticky="w", padx=(20, 0))
-        ttk.Entry(config, textvariable=self.subject, width=10).grid(row=0, column=4, sticky="w", padx=6)
+        badge_row = ttk.Frame(header, style="Main.TFrame")
+        badge_row.grid(row=0, column=1, rowspan=2, sticky="e")
+        self.status_badge = tk.Label(
+            badge_row,
+            textvariable=self.status_text,
+            bg="#334155",
+            fg="#FFFFFF",
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+        )
+        self.status_badge.pack(side="right", padx=(8, 0))
+        self.armed_badge = tk.Label(
+            badge_row,
+            textvariable=self.armed_text,
+            bg="#1E293B",
+            fg=self.AMBER,
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=8,
+        )
+        self.armed_badge.pack(side="right")
 
-        ttk.Label(config, text="Broker:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(config, textvariable=self.broker, width=35).grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(config, text="Port:").grid(row=1, column=2, sticky="e", pady=(8, 0))
-        ttk.Entry(config, textvariable=self.port, width=8).grid(row=1, column=3, sticky="w", padx=6, pady=(8, 0))
+        config = self._card(shell)
+        config.grid(row=1, column=0, sticky="ew", pady=(16, 14))
+        config.columnconfigure(1, weight=3)
+        config.columnconfigure(3, weight=1)
+        config.columnconfigure(5, weight=1)
 
-        ttk.Label(config, text="Username:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(config, textvariable=self.username, width=35).grid(row=2, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(config, text="Password:").grid(row=2, column=2, sticky="e", pady=(8, 0))
-        ttk.Entry(config, textvariable=self.password, show="*", width=28).grid(row=2, column=3, columnspan=2, sticky="w", padx=6, pady=(8, 0))
+        ttk.Label(config, text="Cấu hình dữ liệu & MQTT", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 10))
+        self._field(config, 1, 0, "Folder gốc", self.output_dir, width=42)
+        ttk.Button(config, text="Chọn folder", style="Ghost.TButton", command=self.choose_output_dir).grid(row=1, column=2, sticky="ew", padx=(8, 16))
+        self._field(config, 1, 3, "Subject", self.subject, width=10)
 
-        ttk.Label(config, text="Topic:").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(config, textvariable=self.topic, width=35).grid(row=3, column=1, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Button(config, text="Kết nối MQTT", command=self.connect_mqtt).grid(row=3, column=2, padx=4, pady=(8, 0))
-        ttk.Button(config, text="Ngắt kết nối", command=self.disconnect_mqtt).grid(row=3, column=3, padx=4, pady=(8, 0))
+        self._field(config, 2, 0, "Broker", self.broker, width=30)
+        self._field(config, 2, 3, "Port", self.port, width=10)
+        self._field(config, 2, 5, "Topic", self.topic, width=24)
 
-        config.columnconfigure(1, weight=1)
+        self._field(config, 3, 0, "Username", self.username, width=30)
+        self._field(config, 3, 3, "Password", self.password, width=22, show="*")
+        mqtt_actions = ttk.Frame(config, style="Card.TFrame")
+        mqtt_actions.grid(row=3, column=5, sticky="ew", padx=(10, 0))
+        ttk.Button(mqtt_actions, text="Kết nối", style="Primary.TButton", command=self.connect_mqtt).pack(side="left", fill="x", expand=True)
+        ttk.Button(mqtt_actions, text="Ngắt", style="Danger.TButton", command=self.disconnect_mqtt).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-        status = ttk.Frame(main)
-        status.pack(fill="x", pady=10)
-        ttk.Label(status, textvariable=self.status_text, font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Label(status, textvariable=self.armed_text, font=("Segoe UI", 10, "bold")).pack(side="right")
+        content = ttk.Frame(shell, style="Main.TFrame")
+        content.grid(row=2, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
 
-        body = ttk.Frame(main)
-        body.pack(fill="both", expand=True)
+        fall_card = self._task_panel(content, "FALL", "label_binary = 1", self.RED, "fall")
+        fall_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        not_fall_card = self._task_panel(content, "NOT FALL", "label_binary = 0", self.GREEN, "not_fall")
+        not_fall_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        fall_frame = ttk.LabelFrame(body, text="FALL - label_binary = 1", padding=10)
-        fall_frame.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self._add_task_buttons(fall_card.body, FALL_TASKS, self.RED, self.RED_DARK)
+        self._add_task_buttons(not_fall_card.body, NOT_FALL_TASKS, self.GREEN, self.GREEN_DARK)
 
-        not_fall_frame = ttk.LabelFrame(body, text="NOT FALL - label_binary = 0", padding=10)
-        not_fall_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        bottom = ttk.Frame(shell, style="Main.TFrame")
+        bottom.grid(row=3, column=0, sticky="nsew", pady=(14, 0))
+        bottom.columnconfigure(0, weight=0)
+        bottom.columnconfigure(1, weight=1)
 
-        self._add_task_buttons(fall_frame, FALL_TASKS)
-        self._add_task_buttons(not_fall_frame, NOT_FALL_TASKS)
+        actions = self._card(bottom)
+        actions.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        ttk.Label(actions, text="Thao tác nhanh", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 10))
+        ttk.Button(actions, text="Hủy task đang chờ", style="Danger.TButton", command=self.clear_task).pack(fill="x", pady=4)
+        ttk.Button(actions, text="Mở folder data", style="Ghost.TButton", command=self.open_output_folder).pack(fill="x", pady=4)
+        ttk.Button(actions, text="Tạo cây thư mục", style="Primary.TButton", command=self.create_folder_tree).pack(fill="x", pady=4)
 
-        actions = ttk.Frame(main)
-        actions.pack(fill="x", pady=8)
-        ttk.Button(actions, text="Hủy task đang chờ", command=self.clear_task).pack(side="left")
-        ttk.Button(actions, text="Mở folder data", command=self.open_output_folder).pack(side="left", padx=8)
-        ttk.Button(actions, text="Tạo sẵn cây thư mục", command=self.create_folder_tree).pack(side="left")
+        log_card = self._card(bottom)
+        log_card.grid(row=0, column=1, sticky="nsew")
+        log_card.rowconfigure(1, weight=1)
+        log_card.columnconfigure(0, weight=1)
+        ttk.Label(log_card, text="Log hệ thống", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        log_frame = ttk.LabelFrame(main, text="Log", padding=8)
-        log_frame.pack(fill="both", expand=True)
-        self.log_box = tk.Text(log_frame, height=12, wrap="word")
-        self.log_box.pack(fill="both", expand=True)
+        log_wrap = tk.Frame(log_card, bg="#0B1220", highlightbackground=self.BORDER, highlightthickness=1)
+        log_wrap.grid(row=1, column=0, sticky="nsew")
+        log_wrap.rowconfigure(0, weight=1)
+        log_wrap.columnconfigure(0, weight=1)
+        self.log_box = tk.Text(
+            log_wrap,
+            height=9,
+            wrap="word",
+            bg="#0B1220",
+            fg="#D1D5DB",
+            insertbackground=self.TEXT,
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=10,
+            font=("Consolas", 10),
+        )
+        self.log_box.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(log_wrap, orient="vertical", command=self.log_box.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.log_box.configure(yscrollcommand=scrollbar.set)
+        self.log_box.tag_configure("INFO", foreground="#D1D5DB")
+        self.log_box.tag_configure("OK", foreground=self.GREEN)
+        self.log_box.tag_configure("WARN", foreground=self.AMBER)
+        self.log_box.tag_configure("ERR", foreground=self.RED)
+        self.log_box.tag_configure("READY", foreground=self.BLUE)
 
         self.log("Cách dùng: chọn task trước → thực hiện động tác → ESP32 gửi sensor/fall_raw → app lưu đúng 1 file CSV.")
         self.log("Cây thư mục: data/fall/<task>/*.csv và data/not_fall/<task>/*.csv")
 
-    def _add_task_buttons(self, parent: ttk.Frame, tasks: list[Task]) -> None:
+    def _card(self, parent: tk.Widget) -> ttk.Frame:
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        return frame
+
+    def _field(self, parent: ttk.Frame, row: int, col: int, label: str, variable: tk.Variable, width: int, show: str | None = None) -> None:
+        cell = ttk.Frame(parent, style="Card.TFrame")
+        cell.grid(row=row, column=col, columnspan=2 if col == 0 else 1, sticky="ew", padx=(0, 10), pady=5)
+        cell.columnconfigure(0, weight=1)
+        ttk.Label(cell, text=label, style="CardMuted.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        entry = ttk.Entry(cell, textvariable=variable, width=width, show=show or "")
+        entry.grid(row=1, column=0, sticky="ew")
+
+    def _task_panel(self, parent: tk.Widget, title: str, subtitle: str, color: str, tag: str):
+        outer = self._card(parent)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(outer, style="Card.TFrame")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        top.columnconfigure(1, weight=1)
+        dot = tk.Canvas(top, width=14, height=14, bg=self.CARD, highlightthickness=0)
+        dot.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 8))
+        dot.create_oval(2, 2, 12, 12, fill=color, outline=color)
+        ttk.Label(top, text=title, style="CardTitle.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(top, text=subtitle, style="CardMuted.TLabel").grid(row=1, column=1, sticky="w")
+
+        body = ttk.Frame(outer, style="Card.TFrame")
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        outer.body = body
+        outer.tag = tag
+        return outer
+
+    def _add_task_buttons(self, parent: ttk.Frame, tasks: list[Task], color: str, active_color: str) -> None:
         for i, task in enumerate(tasks):
-            text = f"{task.name}\n{task.display}"
-            btn = ttk.Button(parent, text=text, command=lambda t=task: self.arm_task(t))
-            btn.grid(row=i // 2, column=i % 2, sticky="ew", padx=5, pady=5)
-        parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=1)
+            btn = tk.Button(
+                parent,
+                text=f"{task.name}\n{task.display}",
+                command=lambda t=task: self.arm_task(t),
+                bg=self.CARD_2,
+                fg=self.TEXT,
+                activebackground=active_color,
+                activeforeground="#FFFFFF",
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=12,
+                cursor="hand2",
+                justify="left",
+                anchor="w",
+                font=("Segoe UI", 10, "bold"),
+                highlightthickness=1,
+                highlightbackground=self.BORDER,
+            )
+            btn.default_bg = self.CARD_2
+            btn.default_fg = self.TEXT
+            btn.active_color = color
+            btn.task = task
+            btn.bind("<Enter>", lambda e, b=btn, c=color: b.configure(bg=c, fg="#FFFFFF"))
+            btn.bind("<Leave>", lambda e, b=btn: self._refresh_task_button(b))
+            btn.grid(row=i // 2, column=i % 2, sticky="nsew", padx=5, pady=5)
+            self.task_buttons.append(btn)
+
+        for col in range(2):
+            parent.columnconfigure(col, weight=1)
+        for row in range((len(tasks) + 1) // 2):
+            parent.rowconfigure(row, weight=1)
+
+    def _refresh_task_button(self, btn: tk.Button) -> None:
+        current = self.state.current()
+        if current is not None and current[0] == btn.task:
+            btn.configure(bg=btn.active_color, fg="#FFFFFF")
+        else:
+            btn.configure(bg=btn.default_bg, fg=btn.default_fg)
+
+    def _refresh_task_buttons(self) -> None:
+        for btn in self.task_buttons:
+            self._refresh_task_button(btn)
 
     def choose_output_dir(self) -> None:
         selected = filedialog.askdirectory(title="Chọn folder gốc để lưu data")
@@ -367,7 +577,7 @@ class CollectorApp:
         for task in ALL_TASKS:
             (root_dir / task.label / task.name).mkdir(parents=True, exist_ok=True)
         ensure_labels_file(root_dir)
-        self.log(f"Đã tạo cây thư mục trong: {root_dir}")
+        self.log(f"Đã tạo cây thư mục trong: {root_dir}", "OK")
 
     def open_output_folder(self) -> None:
         root_dir = Path(self.output_dir.get())
@@ -387,19 +597,23 @@ class CollectorApp:
         self.subject.set(subject)
         self.state.arm(task, subject)
         self.armed_text.set(f"Đang chờ: {subject} | {task.label} | {task.name}")
-        self.log(f"READY: {subject} | {task.label} | {task.name}. Bây giờ hãy thực hiện động tác.")
+        self.armed_badge.configure(bg="#422006", fg=self.AMBER)
+        self._refresh_task_buttons()
+        self.log(f"READY: {subject} | {task.label} | {task.name}. Bây giờ hãy thực hiện động tác.", "READY")
 
     def clear_task(self) -> None:
         self.state.disarm()
         self.armed_text.set("Chưa chọn task")
-        self.log("Đã hủy task đang chờ.")
+        self.armed_badge.configure(bg="#1E293B", fg=self.AMBER)
+        self._refresh_task_buttons()
+        self.log("Đã hủy task đang chờ.", "WARN")
 
     def connect_mqtt(self) -> None:
         if mqtt is None:
             messagebox.showerror("Thiếu thư viện", "Chưa cài paho-mqtt. Chạy: pip install paho-mqtt certifi")
             return
         if self.connected:
-            self.log("MQTT đã kết nối rồi.")
+            self.log("MQTT đã kết nối rồi.", "OK")
             return
         try:
             client_id = f"fall_data_ui_{int(time.time())}"
@@ -417,10 +631,11 @@ class CollectorApp:
             client.loop_start()
             self.client = client
             self.status_text.set("Đang kết nối MQTT...")
-            self.log(f"Đang kết nối MQTT broker={self.broker.get()} topic={self.topic.get()}")
+            self.status_badge.configure(bg="#1D4ED8", fg="#FFFFFF")
+            self.log(f"Đang kết nối MQTT broker={self.broker.get()} topic={self.topic.get()}", "READY")
         except Exception as exc:
             messagebox.showerror("MQTT error", str(exc))
-            self.log(f"MQTT error: {exc}")
+            self.log(f"MQTT error: {exc}", "ERR")
 
     def disconnect_mqtt(self) -> None:
         if self.client is not None:
@@ -432,33 +647,35 @@ class CollectorApp:
         self.client = None
         self.connected = False
         self.status_text.set("Đã ngắt MQTT")
-        self.log("Đã ngắt kết nối MQTT.")
+        if hasattr(self, "status_badge"):
+            self.status_badge.configure(bg="#334155", fg="#FFFFFF")
+        self.log("Đã ngắt kết nối MQTT.", "WARN")
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
         if reason_code == 0:
             self.connected = True
             client.subscribe(self.topic.get(), qos=1)
-            self.event_queue.put(("log", f"MQTT connected. Subscribed: {self.topic.get()}"))
-            self.event_queue.put(("status", "MQTT đã kết nối"))
+            self.event_queue.put(("log_ok", f"MQTT connected. Subscribed: {self.topic.get()}"))
+            self.event_queue.put(("status_ok", "MQTT đã kết nối"))
         else:
-            self.event_queue.put(("log", f"MQTT connect failed: {reason_code}"))
-            self.event_queue.put(("status", f"MQTT lỗi: {reason_code}"))
+            self.event_queue.put(("log_err", f"MQTT connect failed: {reason_code}"))
+            self.event_queue.put(("status_err", f"MQTT lỗi: {reason_code}"))
 
     def _on_disconnect(self, client, userdata, rc, properties=None) -> None:
         self.connected = False
-        self.event_queue.put(("status", "MQTT đã ngắt"))
-        self.event_queue.put(("log", f"MQTT disconnected rc={rc}"))
+        self.event_queue.put(("status_warn", "MQTT đã ngắt"))
+        self.event_queue.put(("log_warn", f"MQTT disconnected rc={rc}"))
 
     def _on_message(self, client, userdata, msg) -> None:
         armed = self.state.consume()
         if armed is None:
-            self.event_queue.put(("log", "Nhận fall_raw nhưng chưa chọn task, bỏ qua. Hãy chọn task trước khi test."))
+            self.event_queue.put(("log_warn", "Nhận fall_raw nhưng chưa chọn task, bỏ qua. Hãy chọn task trước khi test."))
             return
 
         task, subject = armed
         decoded = decode_fall_raw_binary(msg.payload)
         if decoded is None:
-            self.event_queue.put(("log", "Decode fall_raw thất bại. Chọn lại task và test lại."))
+            self.event_queue.put(("log_err", "Decode fall_raw thất bại. Chọn lại task và test lại."))
             return
 
         try:
@@ -472,7 +689,7 @@ class CollectorApp:
                 "pre": decoded.get("pre_samples"),
             }))
         except Exception as exc:
-            self.event_queue.put(("log", f"Lỗi lưu CSV: {exc}"))
+            self.event_queue.put(("log_err", f"Lỗi lưu CSV: {exc}"))
 
     def _poll_events(self) -> None:
         while True:
@@ -483,23 +700,42 @@ class CollectorApp:
 
             if kind == "log":
                 self.log(str(payload))
+            elif kind == "log_ok":
+                self.log(str(payload), "OK")
+            elif kind == "log_warn":
+                self.log(str(payload), "WARN")
+            elif kind == "log_err":
+                self.log(str(payload), "ERR")
             elif kind == "status":
                 self.status_text.set(str(payload))
+            elif kind == "status_ok":
+                self.status_text.set(str(payload))
+                self.status_badge.configure(bg=self.GREEN_DARK, fg="#FFFFFF")
+            elif kind == "status_warn":
+                self.status_text.set(str(payload))
+                self.status_badge.configure(bg="#334155", fg="#FFFFFF")
+            elif kind == "status_err":
+                self.status_text.set(str(payload))
+                self.status_badge.configure(bg=self.RED_DARK, fg="#FFFFFF")
             elif kind == "saved":
                 info = payload
                 task = info["task"]
                 self.armed_text.set("Chưa chọn task")
+                self.armed_badge.configure(bg="#1E293B", fg=self.AMBER)
+                self._refresh_task_buttons()
                 self.log(
                     f"SAVED: {info['path']} | subject={info['subject']} | "
-                    f"label={task.label} | task={task.name} | samples={info['samples']} | pre={info['pre']}"
+                    f"label={task.label} | task={task.name} | samples={info['samples']} | pre={info['pre']}",
+                    "OK",
                 )
-                self.log("Đã lưu đúng 1 window. Hãy chọn task tiếp theo rồi mới test tiếp.")
+                self.log("Đã lưu đúng 1 window. Hãy chọn task tiếp theo rồi mới test tiếp.", "INFO")
 
         self.root.after(150, self._poll_events)
 
-    def log(self, message: str) -> None:
+    def log(self, message: str, level: str = "INFO") -> None:
         now = time.strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{now}] {message}\n")
+        tag = level if level in {"INFO", "OK", "WARN", "ERR", "READY"} else "INFO"
+        self.log_box.insert("end", f"[{now}] {message}\n", tag)
         self.log_box.see("end")
 
     def on_close(self) -> None:

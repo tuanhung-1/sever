@@ -969,9 +969,17 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
 
         confidence = float(prediction.confidence)
         detected = bool(prediction.fall_detected)
+        prediction_details = prediction.details or {}
         model_name = getattr(model, "model_name", "unknown")
+        deep_confidence = prediction_details.get("deep_confidence")
+        tabular_confidence = prediction_details.get("tabular_confidence")
+        ensemble_confidence = prediction_details.get("ensemble_confidence")
+        strong_override = prediction_details.get("strong_event_override") or {}
         print(
-            f"🧠 [MODEL:{model_name}] Inference: confidence={confidence:.3f} → detected={detected}"
+            f"🧠 [MODEL:{model_name}] Inference: "
+            f"deep={deep_confidence} tabular={tabular_confidence} "
+            f"ensemble={ensemble_confidence} strong_override={strong_override.get('passed')} "
+            f"→ detected={detected}"
         )
 
         alert_trigger = "fall_raw"
@@ -988,6 +996,7 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
             'reason': reason,
             'alert_trigger': alert_trigger,
             'status': "model_result",
+            'details': prediction_details,
         }
 
     except Exception as e:
