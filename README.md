@@ -25,8 +25,8 @@ wsgi.py                    # WSGI entrypoint
 
 Runtime history files are written to `storage/history/` by default. That folder is ignored by git and created automatically when needed.
 
-The fall detector loads `artifacts/fall_detection/multistage/fall_cnn_gated_nolambda.keras` with its `fall_cnn_metadata.json`, `fall_cnn_mean.npy`, and `fall_cnn_std.npy` preprocessing artifacts.
-The current trained model uses a 320-sample window, 8 motion features, threshold `0.87`, and the metadata `soft_peak_filter`.
+The fall detector now loads the v5 hybrid artifact set in `artifacts/fall_detection/multistage/`, centered on `fall_v5_hybrid_deep.keras` and `fall_v5_metadata.json`.
+The current trained model uses a 320-sample window, dual-input sequence + handcrafted features, and a threshold of `0.73`.
 
 ## Setup
 

@@ -23,20 +23,20 @@ Base URL local:
 
 ## AI Model
 
-Fall detection uses the trained multi-stage gated 1D CNN artifacts in:
+Fall detection uses the trained v5 hybrid artifacts in:
 
-- `artifacts/fall_detection/multistage/fall_cnn_gated_nolambda.keras`
-- `artifacts/fall_detection/multistage/fall_cnn_metadata.json`
-- `artifacts/fall_detection/multistage/fall_cnn_mean.npy`
-- `artifacts/fall_detection/multistage/fall_cnn_std.npy`
+- `artifacts/fall_detection/multistage/fall_v5_hybrid_deep.keras`
+- `artifacts/fall_detection/multistage/fall_v5_metadata.json`
+- `artifacts/fall_detection/multistage/fall_v5_sequence_mean.npy`
+- `artifacts/fall_detection/multistage/fall_v5_sequence_std.npy`
 
 Current model metadata:
 
 - Window size: `320`
 - Target rate: `100 Hz`
-- Features: `ax, ay, az, gx, gy, gz, acc_mag, gyro_mag`
-- Threshold: `0.87`
-- Post-filter: `soft_peak_filter`
+- Features: dual-input sequence + handcrafted features derived from the 8-channel IMU window
+- Threshold: `0.73`
+- Post-filter: `post_fall_confirmation`
 
 ## Socket.IO
 

@@ -910,15 +910,15 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
         trigger_ts = decoded_data['trigger_ts']
         pre_samples = decoded_data['pre_samples']
 
-        raw6 = np.asarray(samples_array, dtype=np.float32)[:, :6]
-        window_size = int(getattr(model, "window_size", raw6.shape[0]) or raw6.shape[0])
+        raw_window = np.asarray(samples_array, dtype=np.float32)
+        window_size = int(getattr(model, "window_size", raw_window.shape[0]) or raw_window.shape[0])
 
-        if raw6.shape[0] == 0:
+        if raw_window.shape[0] == 0:
             print("fall_raw khong co sample")
             return None
-        if raw6.shape[0] < window_size:
+        if raw_window.shape[0] < window_size:
             print(
-                f"fall_raw ngan hon window model: {raw6.shape[0]}/{window_size} samples, "
+                f"fall_raw ngan hon window model: {raw_window.shape[0]}/{window_size} samples, "
                 "khong chay model de tranh du doan sai"
             )
             return {
@@ -933,27 +933,27 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
                 'status': "insufficient_samples",
             }
 
-        def _select_window(raw6_window: np.ndarray, center_idx, size: int) -> np.ndarray:
-            if raw6_window.shape[0] <= size:
-                return raw6_window
+        def _select_window(raw_window_data: np.ndarray, center_idx, size: int) -> np.ndarray:
+            if raw_window_data.shape[0] <= size:
+                return raw_window_data
 
             try:
                 center = int(center_idx)
             except (TypeError, ValueError):
                 center = None
 
-            if center is None or center < 0 or center >= raw6_window.shape[0]:
-                return raw6_window[:size]
+            if center is None or center < 0 or center >= raw_window_data.shape[0]:
+                return raw_window_data[:size]
 
             start = max(0, center - size // 2)
             end = start + size
-            if end > raw6_window.shape[0]:
-                end = raw6_window.shape[0]
+            if end > raw_window_data.shape[0]:
+                end = raw_window_data.shape[0]
                 start = end - size
-            return raw6_window[start:end]
+            return raw_window_data[start:end]
 
-        raw6_window = _select_window(raw6, pre_samples, window_size)
-        print(f"✅ fall_raw du: {raw6_window.shape[0]}/{window_size} samples → Chay model")
+        raw_window = _select_window(raw_window, pre_samples, window_size)
+        print(f"✅ fall_raw du: {raw_window.shape[0]}/{window_size} samples → Chay model")
 
         with _latest_vitals_lock:
             hr = _latest_hr
@@ -963,7 +963,7 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
         print(f"💚 Latest vitals từ sensor/data: HR={hr} BPM, SpO2={spo2:.1f}%, Temp={temp:.1f}°C")
 
         prediction = model.predict_raw_window(
-            raw6_window,
+            raw_window,
             vitals={"heart_rate": hr, "spo2": spo2, "temp": temp},
         )
 

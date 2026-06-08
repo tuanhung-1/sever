@@ -1,0 +1,15 @@
+{
+  "min_context_seconds": 5.0,
+  "analysis_seconds": 3.0,
+  "max_acc_std_g": 0.07,
+  "max_acc_one_g_error": 0.14,
+  "max_gyro_mean_dps": 20.0,
+  "max_gyro_p90_dps": 55.0,
+  "max_jerk_mean_gps": 1.8,
+  "min_still_ratio": 0.6,
+  "required_stillness_votes": 5,
+  "strong_probability": 0.92,
+  "strong_acc_peak_g": 2.5,
+  "strong_gyro_peak_dps": 300.0,
+  "strong_jerk_peak_gps": 15.0
+}

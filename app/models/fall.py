@@ -15,6 +15,14 @@ from app.core.config import settings
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_ARTIFACT_DIR = BASE_DIR / "artifacts" / "fall_detection" / "multistage"
+LEGACY_MODEL_FILE = "fall_cnn_gated_nolambda.keras"
+V5_MODEL_FILE = "fall_v5_hybrid_deep.keras"
+LEGACY_METADATA_FILE = "fall_cnn_metadata.json"
+V5_METADATA_FILE = "fall_v5_metadata.json"
+LEGACY_MEAN_FILE = "fall_cnn_mean.npy"
+V5_MEAN_FILE = "fall_v5_sequence_mean.npy"
+LEGACY_STD_FILE = "fall_cnn_std.npy"
+V5_STD_FILE = "fall_v5_sequence_std.npy"
 KERAS_CONFIG_DROP_KEYS = {
     "renorm",
     "renorm_clipping",
@@ -114,7 +122,11 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
         threshold: float | None = None,
     ) -> None:
         self.artifact_dir = Path(artifact_dir).resolve()
-        self.metadata = _load_json(self.artifact_dir / "fall_cnn_metadata.json")
+        self.metadata_path = self._resolve_artifact_file(
+            V5_METADATA_FILE,
+            LEGACY_METADATA_FILE,
+        )
+        self.metadata = _load_json(self.metadata_path)
 
         self.window_size = int(self.metadata.get("window_size", 200))
         self.feature_keys = list(
@@ -123,17 +135,19 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
                 ["ax", "ay", "az", "gx", "gy", "gz", "acc_mag", "gyro_mag"],
             )
         )
+        self.handcrafted_feature_names = list(self.metadata.get("handcrafted_feature_names", []))
         self._model_file = model_file
         self._threshold = float(threshold if threshold is not None else self.metadata.get("threshold", 0.8))
         self._post_filter = dict(self.metadata.get("post_filter") or {})
 
-        self._mean = self._load_vector("fall_cnn_mean.npy")
-        self._std = self._load_vector("fall_cnn_std.npy")
+        self._mean = self._load_vector(V5_MEAN_FILE, LEGACY_MEAN_FILE)
+        self._std = self._load_vector(V5_STD_FILE, LEGACY_STD_FILE)
         self._std = np.where(np.abs(self._std) < 1e-8, 1.0, self._std).astype(np.float32)
 
         self.model_path = self._resolve_model_path()
         tf = _import_tensorflow()
         self._model = self._load_model(tf)
+        self._input_names = [tensor.name.split(":")[0] for tensor in getattr(self._model, "inputs", [])]
 
     def _load_model(self, tf):
         try:
@@ -151,21 +165,30 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
                 except OSError:
                     pass
 
-    def _load_vector(self, file_name: str) -> np.ndarray:
-        path = self.artifact_dir / file_name
-        if not path.exists():
-            raise RuntimeError(f"Khong tim thay scaler artifact: {path}")
+    def _resolve_artifact_file(self, *candidate_names: str) -> Path:
+        for file_name in candidate_names:
+            path = self.artifact_dir / file_name
+            if path.exists():
+                return path.resolve()
+        joined = ", ".join(candidate_names)
+        raise RuntimeError(f"Khong tim thay artifact trong {self.artifact_dir}: {joined}")
+
+    def _load_vector(self, *candidate_names: str) -> np.ndarray:
+        path = self._resolve_artifact_file(*candidate_names)
         values = np.load(path).astype(np.float32)
         if values.shape != (len(self.feature_keys),):
             raise RuntimeError(
-                f"Scaler {file_name} co shape {values.shape}, "
+                f"Scaler {path.name} co shape {values.shape}, "
                 f"nhung model can {(len(self.feature_keys),)}"
             )
         return values
 
     def _resolve_model_path(self) -> Path:
         requested = self._model_file
-        candidates = [requested] if requested else ["fall_cnn_gated_nolambda.keras"]
+        candidates = []
+        if requested:
+            candidates.append(requested)
+        candidates.extend([V5_MODEL_FILE, LEGACY_MODEL_FILE])
 
         for candidate in candidates:
             if not candidate:
@@ -178,31 +201,152 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
 
         raise RuntimeError(
             "Khong tim thay file model fall AI. Can mot trong cac file: "
-            "fall_cnn_gated_nolambda.keras"
+            f"{V5_MODEL_FILE}, {LEGACY_MODEL_FILE}"
         )
 
-    def _raw6_to_features(self, raw6_window: np.ndarray) -> np.ndarray:
-        raw6 = np.asarray(raw6_window, dtype=np.float32)
-        if raw6.ndim != 2 or raw6.shape[1] < 6:
-            raise ValueError("raw6_window phai co shape (samples, 6)")
+    def _trailing_mean(self, values: np.ndarray, window: int) -> np.ndarray:
+        output = np.empty_like(values, dtype=np.float32)
+        for idx in range(values.shape[0]):
+            start = max(0, idx - window + 1)
+            output[idx] = float(np.mean(values[start : idx + 1]))
+        return output
 
-        raw6 = self._fit_window(raw6[:, :6])
-        ax, ay, az, gx, gy, gz = raw6.T
-        acc_mag = np.sqrt(ax**2 + ay**2 + az**2)
-        gyro_mag = np.sqrt(gx**2 + gy**2 + gz**2)
+    def _trailing_std(self, values: np.ndarray, window: int) -> np.ndarray:
+        output = np.empty_like(values, dtype=np.float32)
+        for idx in range(values.shape[0]):
+            start = max(0, idx - window + 1)
+            output[idx] = float(np.std(values[start : idx + 1]))
+        return output
 
-        available = {
-            "ax": ax,
-            "ay": ay,
-            "az": az,
-            "gx": gx,
-            "gy": gy,
-            "gz": gz,
-            "acc_mag": acc_mag,
-            "gyro_mag": gyro_mag,
-        }
+    def _trailing_max(self, values: np.ndarray, window: int) -> np.ndarray:
+        output = np.empty_like(values, dtype=np.float32)
+        for idx in range(values.shape[0]):
+            start = max(0, idx - window + 1)
+            output[idx] = float(np.max(values[start : idx + 1]))
+        return output
 
-        return np.column_stack([available[key] for key in self.feature_keys]).astype(np.float32)
+    def _count_local_peaks(self, values: np.ndarray) -> float:
+        if values.size < 3:
+            return float(values.size)
+        peaks = 0
+        for idx in range(1, values.size - 1):
+            if values[idx] >= values[idx - 1] and values[idx] > values[idx + 1]:
+                peaks += 1
+        return float(peaks)
+
+    def _build_sequence_features(self, raw_window: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        raw = np.asarray(raw_window, dtype=np.float32)
+        if raw.ndim != 2 or raw.shape[1] < 8:
+            raise ValueError("raw_window phai co shape (samples, >=8)")
+
+        raw = self._fit_window(raw[:, :8])
+        ax, ay, az, gx, gy, gz, acc_mag_input, jerk = raw.T
+
+        acc_mag = np.asarray(acc_mag_input, dtype=np.float32)
+        gyro_mag = np.sqrt(gx**2 + gy**2 + gz**2).astype(np.float32)
+        acc_mag_diff = np.diff(acc_mag, prepend=acc_mag[:1]).astype(np.float32)
+        gyro_mag_diff = np.diff(gyro_mag, prepend=gyro_mag[:1]).astype(np.float32)
+
+        roll = np.degrees(np.arctan2(ay, az)).astype(np.float32)
+        pitch = np.degrees(np.arctan2(-ax, np.sqrt(ay**2 + az**2))).astype(np.float32)
+
+        acc_roll_mean = self._trailing_mean(acc_mag, 5)
+        acc_roll_std = self._trailing_std(acc_mag, 5)
+        acc_roll_max = self._trailing_max(acc_mag, 5)
+        gyro_roll_std = self._trailing_std(gyro_mag, 5)
+        acc_energy = (acc_mag**2).astype(np.float32)
+        gyro_energy = (gyro_mag**2).astype(np.float32)
+
+        sequence = np.column_stack([
+            ax,
+            ay,
+            az,
+            gx,
+            gy,
+            gz,
+            acc_mag,
+            gyro_mag,
+            acc_mag_diff,
+            gyro_mag_diff,
+            jerk,
+            acc_roll_mean,
+            acc_roll_std,
+            acc_roll_max,
+            gyro_roll_std,
+            roll,
+            pitch,
+            acc_energy,
+            gyro_energy,
+        ]).astype(np.float32)
+
+        peak_idx = int(np.argmax(acc_mag))
+        handcrafted = self._build_handcrafted_features(sequence, peak_idx)
+        return sequence, handcrafted
+
+    def _build_handcrafted_features(self, sequence: np.ndarray, peak_idx: int) -> np.ndarray:
+        values_by_name: dict[str, float] = {}
+        for index, key in enumerate(self.feature_keys):
+            column = sequence[:, index]
+            values_by_name[f"{key}_mean"] = float(np.mean(column))
+            values_by_name[f"{key}_std"] = float(np.std(column))
+            values_by_name[f"{key}_min"] = float(np.min(column))
+            values_by_name[f"{key}_max"] = float(np.max(column))
+            values_by_name[f"{key}_range"] = float(np.max(column) - np.min(column))
+            values_by_name[f"{key}_rms"] = float(np.sqrt(np.mean(column**2)))
+            values_by_name[f"{key}_energy"] = float(np.sum(column**2))
+            values_by_name[f"{key}_p95"] = float(np.percentile(column, 95))
+
+        acc_mag = sequence[:, self.feature_keys.index("acc_mag")]
+        gyro_mag = sequence[:, self.feature_keys.index("gyro_mag")]
+        jerk = sequence[:, self.feature_keys.index("jerk")]
+        roll = sequence[:, self.feature_keys.index("roll")]
+        pitch = sequence[:, self.feature_keys.index("pitch")]
+
+        post_slice = slice(min(max(peak_idx, 0), sequence.shape[0] - 1), None)
+        pre_slice = slice(0, max(peak_idx, 1))
+
+        values_by_name["acc_peak"] = float(np.max(acc_mag))
+        values_by_name["acc_min"] = float(np.min(acc_mag))
+        values_by_name["impact_range"] = float(np.max(acc_mag) - np.min(acc_mag))
+        values_by_name["freefall_depth"] = float(max(0.0, 1.0 - np.min(acc_mag)))
+        values_by_name["gyro_peak"] = float(np.max(gyro_mag))
+        values_by_name["jerk_peak"] = float(np.max(jerk))
+        values_by_name["acc_peak_count"] = self._count_local_peaks(acc_mag)
+        values_by_name["gyro_peak_count"] = self._count_local_peaks(gyro_mag)
+        values_by_name["jerk_peak_count"] = self._count_local_peaks(jerk)
+        values_by_name["roll_change_deg"] = float(np.ptp(roll))
+        values_by_name["pitch_change_deg"] = float(np.ptp(pitch))
+        values_by_name["post_acc_std"] = float(np.std(acc_mag[post_slice]))
+        values_by_name["post_gyro_mean"] = float(np.mean(gyro_mag[post_slice]))
+        values_by_name["post_gyro_std"] = float(np.std(gyro_mag[post_slice]))
+        values_by_name["post_jerk_mean"] = float(np.mean(jerk[post_slice]))
+        values_by_name["post_acc_one_g_error"] = float(np.mean(np.abs(acc_mag[post_slice] - 1.0)))
+        values_by_name["post_roll_std_deg"] = float(np.std(roll[post_slice]))
+        values_by_name["post_pitch_std_deg"] = float(np.std(pitch[post_slice]))
+        values_by_name["pre_acc_mean"] = float(np.mean(acc_mag[pre_slice]))
+        values_by_name["post_acc_mean"] = float(np.mean(acc_mag[post_slice]))
+        values_by_name["pre_gyro_mean"] = float(np.mean(gyro_mag[pre_slice]))
+        values_by_name["post_gyro_mean_2"] = float(np.mean(gyro_mag[post_slice]))
+
+        if len(self.handcrafted_feature_names) != 174:
+            raise RuntimeError(
+                f"metadata handcrafted_feature_names co {len(self.handcrafted_feature_names)} features, "
+                "nhung model can 174"
+            )
+
+        return np.asarray([values_by_name.get(name, 0.0) for name in self.handcrafted_feature_names], dtype=np.float32)
+
+    def _build_model_inputs(self, raw_window: np.ndarray):
+        sequence, handcrafted = self._build_sequence_features(raw_window)
+        sequence_batch = sequence[np.newaxis, :, :].astype(np.float32)
+        handcrafted_batch = handcrafted[np.newaxis, :].astype(np.float32)
+
+        if len(self._input_names) >= 2:
+            return {
+                self._input_names[0]: sequence_batch,
+                self._input_names[1]: handcrafted_batch,
+            }
+        return [sequence_batch, handcrafted_batch]
 
     def _fit_window(self, raw6: np.ndarray) -> np.ndarray:
         if raw6.shape[0] == self.window_size:
@@ -261,15 +405,15 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
 
     def predict_raw_window(
         self,
-        raw6_window: np.ndarray,
+        raw_window: np.ndarray,
         vitals: dict[str, float] | None = None,
     ) -> FallPrediction:
-        features = self._raw6_to_features(raw6_window)
-        x = self._standardize(features)[np.newaxis, :, :]
-        prediction = self._model.predict(x, verbose=0)
+        model_inputs = self._build_model_inputs(raw_window)
+        prediction = self._model.predict(model_inputs, verbose=0)
         confidence = float(np.asarray(prediction).reshape(-1)[0])
 
-        post_filter_passed, post_filter_details = self._post_filter_result(features, confidence)
+        sequence, _ = self._build_sequence_features(raw_window)
+        post_filter_passed, post_filter_details = self._post_filter_result(sequence, confidence)
         detected = confidence >= self._threshold and post_filter_passed
 
         return FallPrediction(
@@ -280,6 +424,7 @@ class MultiStageGatedCnnFallModel(BaseFallModel):
                 "window_size": self.window_size,
                 "feature_keys": self.feature_keys,
                 "model_path": str(self.model_path),
+                "metadata_path": str(self.metadata_path),
                 "post_filter": post_filter_details,
             },
         )

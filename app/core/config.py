@@ -123,7 +123,7 @@ settings = Settings(
         "FALL_MODEL_DIR",
         "artifacts/fall_detection/multistage",
     ),
-    fall_model_file=os.getenv("FALL_MODEL_FILE", "fall_cnn_gated_nolambda.keras"),
+    fall_model_file=os.getenv("FALL_MODEL_FILE", "fall_v5_hybrid_deep.keras"),
     fall_model_threshold=_env_optional_float("FALL_MODEL_THRESHOLD"),
     alert_cooldown_s=max(0, _env_int("ALERT_COOLDOWN_S", 20)),
     alert_bpm_low=_env_int("ALERT_BPM_LOW", 50),
