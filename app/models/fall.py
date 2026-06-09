@@ -30,6 +30,7 @@ KERAS_CONFIG_DROP_KEYS = {
     "renorm_momentum",
     "quantization_config",
 }
+MIN_ALERT_CONFIDENCE = 0.075
 
 
 def _import_tensorflow():
@@ -513,13 +514,18 @@ class V5HybridFallModel(BaseFallModel):
         confidence = self._ensemble_confidence(deep_confidence, tabular_confidence)
         post_filter_passed, post_filter_details = self._post_filter_result(sequence, confidence)
         strong_override = self._strong_event_override(sequence)
+        min_confidence_passed = confidence > MIN_ALERT_CONFIDENCE
         threshold_passed = confidence >= self._threshold
-        detected = (threshold_passed and post_filter_passed) or bool(strong_override["passed"])
+        detected = min_confidence_passed and (
+            (threshold_passed and post_filter_passed) or bool(strong_override["passed"])
+        )
 
         return FallPrediction(
             fall_detected=detected,
             confidence=confidence,
             details={
+                "min_alert_confidence": MIN_ALERT_CONFIDENCE,
+                "min_confidence_passed": min_confidence_passed,
                 "threshold": round(self._threshold, 4),
                 "threshold_passed": threshold_passed,
                 "window_size": self.window_size,

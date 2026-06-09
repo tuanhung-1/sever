@@ -26,7 +26,7 @@ wsgi.py                    # WSGI entrypoint
 Runtime history files are written to `storage/history/` by default. That folder is ignored by git and created automatically when needed.
 
 The fall detector now loads the v5 hybrid artifact set in `artifacts/fall_detection/multistage/`, centered on `fall_v5_hybrid_deep.keras` and `fall_v5_metadata.json`.
-The current trained model uses a 320-sample window, dual-input sequence + handcrafted features, and a threshold of `0.73`.
+The current trained model uses a 320-sample window, dual-input sequence + handcrafted features, a model threshold of `0.73`, and a final alert confidence gate of `> 0.08`.
 
 ## Setup
 

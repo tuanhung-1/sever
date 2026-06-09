@@ -36,6 +36,7 @@ Current model metadata:
 - Target rate: `100 Hz`
 - Features: dual-input sequence + handcrafted features derived from the 8-channel IMU window
 - Threshold: `0.73`
+- Final alert confidence gate: `> 0.08`
 - Post-filter: `post_fall_confirmation`
 
 ## Socket.IO
