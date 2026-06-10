@@ -16,7 +16,6 @@ TEMP_LOW_THRESHOLD = 32.5     # °C - Low temp (hypothermia)
 # Heart Rate (theo công thức)
 BPM_HIGH_THRESHOLD = 120.0    # beats per minute - Nguy hiểm
 BPM_LOW_THRESHOLD = 50.0      # beats per minute - Thap
-BPM_DELTA_THRESHOLD = 20.0    # Δ BPM > 20 → Bất thường
 
 # SpO₂ (độ bão hòa oxy)
 SPO2_LOW_THRESHOLD = 93.0   # % - Thap (canh bao)
@@ -27,7 +26,6 @@ STATUS_HIGH_HEART_RATE = "HIGH_HEART_RATE"
 STATUS_LOW_HEART_RATE = "LOW_HEART_RATE"
 STATUS_LOW_SPO2 = "LOW_SPO2"
 STATUS_LOW_TEMP = "LOW_TEMP"
-STATUS_FALL_DETECTED = "FALL_DETECTED"  # ← Trạng thái mới (ngã phát hiện)
 STATUS_NORMAL = "NORMAL"
 
 # ─── Batch parsing defaults ───────────────────────────────────────────────────
@@ -473,43 +471,6 @@ def _build_health_data_sample(
     )
 
 
-# ─── Temperature filtering ──────────────────────────────────────────────────
-# Median filter: T = median(T_{i-2}, T_{i-1}, T_i)
-# EMA (Exponential Moving Average): T_smooth = 0.5T + 0.5T_old
-
-_last_temperature = 36.5
-_temperature_lock = None
-
-def _median_filter_temperature(temps: List[float]) -> float:
-    
-    if not temps:
-        return 36.5
-    return float(np.median(np.array(temps, dtype=np.float64)))
-
-
-def _ema_smooth_temperature(temp_new: float, temp_old: float = None, alpha: float = 0.5) -> float:
-    """
-    EMA (Exponential Moving Average): T_smooth = α×T_new + (1-α)×T_old
-    
-    Args:
-        temp_new: Mẫu nhiệt độ mới từ MAX30205
-        temp_old: Giá trị EMA trước đó (default: từ _last_temperature)
-        alpha: Smooth factor (default: 0.5)
-    
-    Returns:
-        Giá trị nhiệt độ đã làm mượt
-    """
-    global _last_temperature
-    
-    if temp_old is None:
-        temp_old = _last_temperature
-    
-    temp_smooth = alpha * temp_new + (1 - alpha) * temp_old
-    _last_temperature = temp_smooth
-    
-    return temp_smooth+0.5
-
-
 # ─── Public payload parsers ───────────────────────────────────────────────────
 def from_batch_dict(payload: Dict[str, Any]) -> List[HealthData]:
     """Parse batch telemetry payload into a list of normalized samples."""
@@ -694,166 +655,3 @@ def classify(bpm, temp, spo2) -> List[str]:
         statuses.append(STATUS_NORMAL)
 
     return statuses
-
-
-# ─── Health Analytics Utils (feature/add-health-utilities) ──────────────────
-# 
-# def validate_health_data(data: HealthData) -> bool:
-#     """
-#     Validate health data completeness and consistency.
-#     
-#     Checks:
-#     - Heart rate in valid range [MIN_BPM, MAX_BPM]
-#     - Temperature in realistic range (25°C - 42°C)
-#     - SpO2 in valid range [MIN_SPO2, MAX_SPO2] if present
-#     - Accelerometer values not NaN
-#     - Timestamp is positive
-#     
-#     Args:
-#         data: HealthData object to validate
-#         
-#     Returns:
-#         True if all validations pass, False otherwise
-#     """
-#     if data.heart_rate < MIN_BPM or data.heart_rate > MAX_BPM:
-#         return False
-#     if data.temp < 25.0 or data.temp > 42.0:
-#         return False
-#     if data.spo2 is not None:
-#         if data.spo2 < MIN_SPO2 or data.spo2 > MAX_SPO2:
-#             return False
-#     if data.timestamp <= 0:
-#         return False
-#     if np.isnan([data.ax, data.ay, data.az]).any():
-#         return False
-#     return True
-
-
-# def detect_anomalies(samples: List[HealthData]) -> Dict[str, List[int]]:
-#     """
-#     Detect anomalies in health data stream using statistical methods.
-#     
-#     Anomalies detected:
-#     - Sudden BPM spike (>30 bpm/s change)
-#     - Temperature fluctuation (>2°C in 60s)
-#     - SpO2 drop (>5% in 30s)
-#     - Accelerometer noise (RMS > threshold)
-#     
-#     Args:
-#         samples: List of HealthData samples ordered by timestamp
-#         
-#     Returns:
-#         Dictionary mapping anomaly_type -> list of sample indices
-#     """
-#     anomalies = {
-#         "bpm_spike": [],
-#         "temp_fluctuation": [],
-#         "spo2_drop": [],
-#         "accel_noise": []
-#     }
-#     
-#     if len(samples) < 2:
-#         return anomalies
-#     
-#     for i in range(1, len(samples)):
-#         prev = samples[i-1]
-#         curr = samples[i]
-#         
-#         # BPM spike detection
-#         if curr.heart_rate and prev.heart_rate:
-#             bpm_delta = abs(curr.heart_rate - prev.heart_rate)
-#             if bpm_delta > 30:
-#                 anomalies["bpm_spike"].append(i)
-#         
-#         # Temperature fluctuation
-#         temp_delta = abs(curr.temp - prev.temp)
-#         if temp_delta > 2.0:
-#             anomalies["temp_fluctuation"].append(i)
-#         
-#         # SpO2 drop
-#         if curr.spo2 and prev.spo2:
-#             spo2_delta = prev.spo2 - curr.spo2
-#             if spo2_delta > 5.0:
-#                 anomalies["spo2_drop"].append(i)
-#     
-#     return anomalies
-
-
-# def generate_health_report(samples: List[HealthData], duration_sec: int) -> Dict[str, Any]:
-#     """
-#     Generate comprehensive health analytics report from sample batch.
-#     
-#     Computes:
-#     - Heart rate statistics (min, max, avg, std)
-#     - Temperature statistics and trend
-#     - SpO2 statistics and stability
-#     - Fall detection events
-#     - Anomaly summary
-#     - Risk level assessment (LOW, MEDIUM, HIGH, CRITICAL)
-#     
-#     Args:
-#         samples: List of HealthData samples
-#         duration_sec: Time window duration in seconds
-#         
-#     Returns:
-#         Dictionary with comprehensive health metrics
-#     """
-#     report = {
-#         "duration_sec": duration_sec,
-#         "sample_count": len(samples),
-#         "timestamp_start": samples[0].timestamp if samples else None,
-#         "timestamp_end": samples[-1].timestamp if samples else None,
-#         "heart_rate": {},
-#         "temperature": {},
-#         "spo2": {},
-#         "fall_events": 0,
-#         "anomalies": {},
-#         "risk_level": "UNKNOWN"
-#     }
-#     
-#     if not samples:
-#         return report
-#     
-#     bpm_values = [s.heart_rate for s in samples if s.heart_rate]
-#     if bpm_values:
-#         report["heart_rate"] = {
-#             "min": float(np.min(bpm_values)),
-#             "max": float(np.max(bpm_values)),
-#             "avg": float(np.mean(bpm_values)),
-#             "std": float(np.std(bpm_values))
-#         }
-#     
-#     temp_values = [s.temp for s in samples]
-#     report["temperature"] = {
-#         "min": float(np.min(temp_values)),
-#         "max": float(np.max(temp_values)),
-#         "avg": float(np.mean(temp_values)),
-#         "std": float(np.std(temp_values))
-#     }
-#     
-#     spo2_values = [s.spo2 for s in samples if s.spo2]
-#     if spo2_values:
-#         report["spo2"] = {
-#             "min": float(np.min(spo2_values)),
-#             "max": float(np.max(spo2_values)),
-#             "avg": float(np.mean(spo2_values)),
-#             "std": float(np.std(spo2_values))
-#         }
-#     
-#     # Count fall events
-#     fall_count = sum(1 for s in samples if STATUS_FALL_DETECTED in s.status)
-#     report["fall_events"] = fall_count
-#     
-#     # Risk assessment
-#     if fall_count > 0:
-#         report["risk_level"] = "CRITICAL"
-#     elif report["temperature"]["max"] > TEMP_FEVER_THRESHOLD or report["temperature"]["min"] < TEMP_LOW_THRESHOLD:
-#         report["risk_level"] = "HIGH"
-#     elif spo2_values and min(spo2_values) < SPO2_LOW_THRESHOLD:
-#         report["risk_level"] = "HIGH"
-#     elif bpm_values and (min(bpm_values) < BPM_LOW_THRESHOLD or max(bpm_values) > BPM_HIGH_THRESHOLD):
-#         report["risk_level"] = "MEDIUM"
-#     else:
-#         report["risk_level"] = "LOW"
-#     
-#     return report

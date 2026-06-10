@@ -20,7 +20,7 @@ from flask import Flask, Response, jsonify, request
 from app.core.config import settings
 from app.core.extensions import socketio
 from app.models.fall import create_fall_model
-from app.models.health import from_json_samples, classify, STATUS_FALL_DETECTED, estimate_bpm_from_ppg_values
+from app.models.health import from_json_samples, classify, estimate_bpm_from_ppg_values
 from app.repositories.history_repository import append_jsonl_record, read_jsonl_records
 
 _buzzer_active = False
@@ -61,7 +61,6 @@ TRAINING_FALL_RAW_FILE = "storage/training/fall_raw_windows.jsonl"
 TRAINING_FALL_RAW_CSV_FILE = "storage/training/fall_raw_training_windows.csv"
 FALL_TRAINING_EXPORT_ENABLED = True
 VALID_TRAINING_LABELS = {"fall", "not_fall"}
-API_VERBOSE_OUTPUT = settings.api_verbose_output
 
 
 API_PORT = settings.api_port
@@ -485,26 +484,6 @@ def _emit_fall(data: dict, delay_ms: int = WS_FALL_EMIT_DELAY_MS):
 # ════════════════════════════════════════════════════════════════════════════════
 # PACKET BUILDERS
 # ════════════════════════════════════════════════════════════════════════════════
-
-def _build_health_packet(health_data, source_topic: str) -> dict:
-    """
-    Build health_update packet — chỉ chứa vitals, KHÔNG chứa fall.
-    """
-    raw_data = health_data.to_dict()
-    data = _normalize_health_data_for_frontend(raw_data)
-
-    packet = {
-        "type": "health_update",
-        "source_topic": source_topic,
-        "server_timestamp": int(time.time()),
-        "data": data,
-    }
-
-    if API_VERBOSE_OUTPUT:
-        packet["data_raw"] = raw_data
-
-    return packet
-
 
 def _build_fall_packet(fall_result: dict, source_topic: str = "sensor/fall_raw") -> dict:
     """
@@ -1135,21 +1114,6 @@ def _normalize_raw_payload_for_api(raw_payload):
         "gx": (None if not gx_series else (gx_series[0] if len(gx_series) == 1 else gx_series)),
         "gy": (None if not gy_series else (gy_series[0] if len(gy_series) == 1 else gy_series)),
         "gz": (None if not gz_series else (gz_series[0] if len(gz_series) == 1 else gz_series)),
-    }
-
-
-def _normalize_health_data_for_frontend(raw_data):
-    bpm = _to_non_negative_number(raw_data.get("bpm"))
-    spo2 = _to_non_negative_number(raw_data.get("spo2"))
-    temp = _to_non_negative_number(raw_data.get("temp"))
-    ts = raw_data.get("ts", raw_data.get("timestamp"))
-
-    return {
-        "ts": int(ts) if ts is not None else None,
-        "bpm": int(round(bpm)) if bpm is not None else None,
-        "spo2": round(spo2, 1) if spo2 is not None else None,
-        "temp": round(temp, 2) if temp is not None else None,
-        "status": raw_data.get("status", "NORMAL"),
     }
 
 
@@ -1814,32 +1778,8 @@ def get_history():
     return jsonify({"count": len(items), "items": items})
 
 
-@app.get("/api/training")
-def get_training_summary():
-    if not FALL_TRAINING_EXPORT_ENABLED:
-        return jsonify({"message": "Fall training export da bi khoa"}), 403
-
-    fall_records = _read_training_records(TRAINING_FALL_RAW_FILE)
-    return jsonify(
-        {
-            "fall_raw_windows": len(fall_records),
-            "csv": {
-                "fall": "/api/training/fall.csv",
-            },
-            "storage": {
-                "fall_jsonl": TRAINING_FALL_RAW_FILE,
-            },
-        }
-    )
 
 
-@app.get("/api/training/fall.csv")
-def export_fall_training_csv():
-    if not FALL_TRAINING_EXPORT_ENABLED:
-        return jsonify({"message": "Fall training export da bi khoa"}), 403
-
-    records = _read_training_records(TRAINING_FALL_RAW_FILE)
-    return _csv_response(_flatten_fall_training_rows(records), "fall_raw_training_windows.csv")
 
 
 def main():
