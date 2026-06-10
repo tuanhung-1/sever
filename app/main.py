@@ -967,7 +967,7 @@ def _process_fall_raw_with_model(decoded_data: dict, alert_data: dict | None = N
 
         return {
             'detected': detected,
-            'confidence': round(confidence, 3),
+            'confidence': round(min(confidence * 10, 1.0), 3),
             'num_samples': num_samples,
             'window_size': window_size,
             'pre_samples': pre_samples,
@@ -1393,7 +1393,7 @@ def on_message(client, userdata, msg):
 
                     # Kích hoạt buzzer nếu ngã được xác nhận
                     if result['detected']:
-                        _send_device_command("buzzer_on", duration_ms=5000)
+                        _send_device_command("buzzer_on", duration_ms=10000)
                 else:
                     print("⚠️  Model không trả về kết quả")
 
